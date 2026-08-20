@@ -69,6 +69,16 @@ Usage:
     python3 synced_capture.py
     python3 synced_capture.py --max-current 100 --p-gain 80 --monitor-fps 10
     python3 synced_capture.py --no-monitor --max-duration 30
+    python3 synced_capture.py --episodes 100
+        Batch mode -- e.g. collecting N demonstrations for imitation
+        learning back to back. Camera connection and servo torque stay up
+        for the whole session (only each episode's own state resets, see
+        RealSenseCapture.reset_for_new_episode), so episode 2+ starts
+        instantly instead of reconnecting. Each episode still needs its own
+        Enter/Space to start and stop, in terminal or monitor window, since
+        a human performs a variable-length demonstration each time. Press
+        q/Esc or close the monitor window at any point to stop the whole
+        batch early (a plain Enter/Space only ends the current episode).
 """
 
 from __future__ import annotations
@@ -90,6 +100,40 @@ sys.path.insert(0, str(REPO_ROOT / "servo"))
 
 import camera_collecting as cam  # noqa: E402
 import spring_position_mode as servo_mod  # noqa: E402
+
+# Default calibration table -- mapping_csv/mapping_function.csv, a 52-point
+# kinematic mapping (gear_displacement in deg -> gripper_displacement in mm)
+# derived from this gripper's rack-and-pinion geometry. See
+# mapping_csv/mapping_function.png for the plotted curve and
+# mapping_csv/gear_displacement.csv / gripper_displacement.csv /
+# gear_rack_displacement.csv for the underlying time-series it was built
+# from. Always overridable with --gripper-calibration-csv. Defined here
+# (before CombinedMonitor/ServoPoller) rather than down by
+# load_gripper_calibration because CombinedMonitor.__init__ references
+# GRIPPER_MAX_WIDTH_MM as a parameter default, which is evaluated at class-
+# definition time -- it has to already exist by the time that class is
+# defined below, not just by the time it's first called.
+DEFAULT_GRIPPER_CALIBRATION_CSV = REPO_ROOT / "mapping_csv" / "mapping_function.csv"
+
+# Bias (deg) between the calibration CSV's own zero point
+# (gear_displacement=0, the fully-closed end) and the servo's raw absolute
+# reading at that same physical end stop. gear_displacement=0 IS the
+# fully-closed position (gripper_displacement there is ~0mm). Close to but
+# not exactly GRIPPER_CLOSED_DEG (216.9) -- set to 221 deg per live testing
+# on 2026-08-19 (observed raw range 225-323 deg while running -- 221 was
+# picked as the calibrated closed-end reference over 216.9). An earlier
+# guess of -221 deg was tried first and confirmed wrong (nowhere near the
+# observed range).
+GRIPPER_CALIBRATION_BIAS_DEG = 221.0
+
+# Real measured maximum gripper opening (mm). The CSV's kinematic model
+# overshoots this near full-open (predicts up to ~85.4mm there) -- the
+# idealized linkage geometry it was derived from doesn't capture whatever
+# actually stops the gripper at 80mm in reality. Rather than trust the
+# model past the real physical limit, interpolated widths are capped here;
+# the CSV/interpolation itself is left untouched (confirmed by testing on
+# 2026-08-19).
+GRIPPER_MAX_WIDTH_MM = 80.0
 
 
 class ServoPoller:
@@ -211,7 +255,7 @@ class CombinedMonitor:
     frame -- cheap, just stores references behind a lock.
     """
 
-    WINDOW_NAME = "Synced capture -- camera + servo position (press q or close to stop)"
+    WINDOW_NAME = "Synced capture -- Enter/Space: start/stop episode, q/close: stop batch"
 
     # Panel look: white background, blue line, black text -- easy to change
     # here if the palette should change again.
@@ -221,6 +265,13 @@ class CombinedMonitor:
     GRID_COLOR = (215, 215, 215)   # BGR: light gray
     GRID_DIVISIONS = 4              # grid cells per axis
 
+    # Recording-status indicator (border around the whole window + a text
+    # label) -- red/"RECORDING" while capture.active is set, gray/"waiting
+    # to start" otherwise. See recording_active in __init__.
+    RECORDING_COLOR = (0, 0, 220)   # BGR: red
+    IDLE_COLOR = (140, 140, 140)    # BGR: gray
+    STATUS_BORDER_PX = 8
+
     def __init__(
         self,
         cv2_module: Any,
@@ -228,12 +279,46 @@ class CombinedMonitor:
         monitor_fps: float,
         on_stop_requested: "Any",
         plot_width: int = 420,
+        gripper_calib: tuple[np.ndarray, np.ndarray] | None = None,
+        gripper_max_width_mm: float = GRIPPER_MAX_WIDTH_MM,
+        on_start_requested: "Any" = None,
+        recording_active: "Any" = None,
+        on_episode_stop_requested: "Any" = None,
     ):
         self.cv2 = cv2_module
         self.window_seconds = window_seconds
         self.min_interval_ns = int(1e9 / monitor_fps) if monitor_fps > 0 else 0
         self.plot_width = plot_width
         self.on_stop_requested = on_stop_requested
+        self.gripper_calib = gripper_calib  # optional (positions, widths) -- see interp_gripper_width_mm
+        self.gripper_max_width_mm = gripper_max_width_mm
+        # Optional -- called (from this monitor thread) when Enter/Space is
+        # pressed while the window has focus, same idea as on_stop_requested
+        # for q/Esc/close. Without this, "Press Enter to start capture" only
+        # listens on the terminal's stdin, so a keystroke sent to the GUI
+        # window (which is what has OS keyboard focus while you're looking
+        # at it) goes nowhere and just looks like recording never starts.
+        # Calling it more than once (e.g. pressed again after recording
+        # already started) is harmless -- see main()'s use of a
+        # threading.Event, which is idempotent to repeat set() calls.
+        self.on_start_requested = on_start_requested
+        # Optional -- called (from this monitor thread) when Enter/Space is
+        # pressed WHILE recording_active is set. Enter/Space is one button
+        # that means different things depending on state: starts when idle
+        # (on_start_requested above), ends the current episode when
+        # recording (this one) -- mirrors the terminal's own "press Enter to
+        # start" / "press Enter to stop" prompts. Without this, Enter/Space
+        # in the monitor window only ever started recording and never
+        # stopped it -- pressing it again mid-recording did nothing (only
+        # q/Esc/close, via on_stop_requested, actually stopped anything, and
+        # that also aborts the whole batch, not just this episode).
+        self.on_episode_stop_requested = on_episode_stop_requested
+        # Optional -- the same threading.Event RealSenseCapture/ServoPoller
+        # already use to gate whether frames/samples actually get recorded
+        # (capture.active). Read-only here, both to show the recording
+        # status and to decide what Enter/Space should do (see above); this
+        # class never sets or clears it.
+        self.recording_active = recording_active
         self.times: list[float] = []
         self.positions: list[float] = []
         self.total_samples_seen = 0  # monotonically increasing, unlike len(self.times),
@@ -280,8 +365,17 @@ class CombinedMonitor:
             x = margin + round(i * plot_w / n)
             cv2.line(panel, (x, margin), (x, margin + plot_h), self.GRID_COLOR, 1, cv2.LINE_AA)
 
-        cv2.putText(panel, "Servo position (deg)", (margin, 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.TEXT_COLOR, 1, cv2.LINE_AA)
+        cv2.putText(panel, "Servo position (deg)", (margin, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.TEXT_COLOR, 1, cv2.LINE_AA)
+
+        # Recording status -- text version of the border _redraw_once draws
+        # around the whole window, so it's readable even if the border color
+        # alone is hard to tell apart (e.g. on a dim/glare-y screen).
+        is_recording = self.recording_active is not None and self.recording_active.is_set()
+        status_text = "* RECORDING (Enter/Space to stop)" if is_recording else "o waiting to start (press Enter/Space)"
+        status_color = self.RECORDING_COLOR if is_recording else self.IDLE_COLOR
+        cv2.putText(panel, status_text, (margin, 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2 if is_recording else 1, cv2.LINE_AA)
 
         if len(self.times) >= 2:
             t0, t1 = self.times[0], self.times[-1]
@@ -315,7 +409,12 @@ class CombinedMonitor:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.TEXT_COLOR, 1, cv2.LINE_AA)
 
         last_str = f"{self.positions[-1]:.2f} deg" if self.positions else "no data yet"
-        cv2.putText(panel, f"{self.total_samples_seen} pts, last={last_str}", (margin, height - 14),
+        text_y = height - 14
+        if self.gripper_calib is not None and self.positions:
+            width_mm = interp_gripper_width_mm(self.positions[-1], self.gripper_calib, self.gripper_max_width_mm)
+            cv2.putText(panel, f"gripper width: {width_mm:.1f} mm", (margin, text_y - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, self.TEXT_COLOR, 1, cv2.LINE_AA)
+        cv2.putText(panel, f"{self.total_samples_seen} pts, last={last_str}", (margin, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, self.TEXT_COLOR, 1, cv2.LINE_AA)
         return panel
 
@@ -359,6 +458,16 @@ class CombinedMonitor:
         plot_panel = self._render_plot_panel(frame_bgr.shape[0])
         combined = np.hstack([frame_bgr, plot_panel])  # the one necessary copy
 
+        # Border around the whole window -- red while actually recording,
+        # gray otherwise -- so recording status is obvious at a glance
+        # without having to read the status text (see _render_plot_panel).
+        # Safe to draw on combined directly: hstack always makes a copy, so
+        # this never touches the original pending frame buffer.
+        is_recording = self.recording_active is not None and self.recording_active.is_set()
+        border_color = self.RECORDING_COLOR if is_recording else self.IDLE_COLOR
+        cv2.rectangle(combined, (0, 0), (combined.shape[1] - 1, combined.shape[0] - 1),
+                      border_color, self.STATUS_BORDER_PX)
+
         cv2.imshow(self.WINDOW_NAME, combined)
         key = cv2.waitKey(1) & 0xFF
         window_closed = cv2.getWindowProperty(self.WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1
@@ -366,6 +475,20 @@ class CombinedMonitor:
             self._stop_event.set()
             if self.on_stop_requested is not None:
                 self.on_stop_requested()
+        # 13/10 = Enter (backend-dependent which one waitKey reports), 32 =
+        # Space -- lets you start/stop without having to click back onto the
+        # terminal first. Context-sensitive, same as the terminal's own
+        # prompts: starts while idle, ends the current episode while
+        # recording -- see on_episode_stop_requested's docstring in
+        # __init__ for why this needs to be a separate branch from just
+        # always calling on_start_requested.
+        elif key in (13, 10, 32):
+            is_recording = self.recording_active is not None and self.recording_active.is_set()
+            if is_recording:
+                if self.on_episode_stop_requested is not None:
+                    self.on_episode_stop_requested()
+            elif self.on_start_requested is not None:
+                self.on_start_requested()
 
     def close(self) -> None:
         """Ask the monitor thread to stop and wait briefly for it -- safe to
@@ -407,18 +530,82 @@ def match_servo_to_frames(
     return matched
 
 
+def load_gripper_calibration(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load a servo-angle -> gripper-opening-width calibration table.
+
+    Expects a CSV with a header row containing (at least) the columns
+    `gear_displacement` (deg) and `gripper_displacement` (mm) -- one row per
+    calibration point, any order (sorted here so np.interp gets a monotonic
+    x). See DEFAULT_GRIPPER_CALIBRATION_CSV. Used to turn a recorded servo
+    angle into a physical gripper opening width -- see
+    interp_gripper_width_mm.
+    """
+    with path.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise ValueError(f"Gripper calibration CSV is empty: {path}")
+    missing = {"gear_displacement", "gripper_displacement"} - set(rows[0].keys())
+    if missing:
+        raise ValueError(
+            f"Gripper calibration CSV {path} is missing column(s) {sorted(missing)}; "
+            f"expected a header with gear_displacement, gripper_displacement."
+        )
+    if len(rows) < 2:
+        raise ValueError(f"Gripper calibration CSV {path} needs at least 2 rows to interpolate, got {len(rows)}.")
+    pairs = sorted((float(r["gear_displacement"]), float(r["gripper_displacement"])) for r in rows)
+    positions = np.array([p for p, _ in pairs])
+    widths = np.array([w for _, w in pairs])
+    return positions, widths
+
+
+def interp_gripper_width_mm(
+    position_deg: float,
+    calib: tuple[np.ndarray, np.ndarray],
+    max_width_mm: float = GRIPPER_MAX_WIDTH_MM,
+) -> float:
+    """Linearly interpolate gripper opening width (mm) for a servo angle
+    (deg). Positions outside the calibration table's own range are clamped
+    to the nearest endpoint's width (np.interp's default behavior) rather
+    than extrapolated -- a position the gripper was never actually
+    calibrated at shouldn't produce a made-up width. The result is then
+    additionally capped at max_width_mm -- see GRIPPER_MAX_WIDTH_MM -- since
+    the CSV's model overshoots the real physical max near full-open."""
+    positions, widths = calib
+    width = float(np.interp(position_deg, positions, widths))
+    return min(width, max_width_mm)
+
+
+def apply_gripper_calibration(
+    matched_rows: list[dict[str, Any]],
+    calib: tuple[np.ndarray, np.ndarray] | None,
+    max_width_mm: float = GRIPPER_MAX_WIDTH_MM,
+) -> None:
+    """Annotate each matched servo row in place with gripper_width_mm --
+    None when no calibration table was given (--gripper-calibration-csv),
+    so the CSV column always exists with a consistent schema either way."""
+    for row in matched_rows:
+        row["gripper_width_mm"] = (
+            interp_gripper_width_mm(row["position_deg"], calib, max_width_mm) if calib is not None else None
+        )
+
+
 def write_servo_csv(path: Path, matched_rows: list[dict[str, Any]]) -> None:
+    # Only frame/timing (to keep this aligned with servo.csv's usual role as
+    # a per-stream file matching gyro.csv/accel.csv) plus gripper_width_mm --
+    # raw position_deg/velocity_deg_s/current_ma/sync_error_ms are no longer
+    # written here (recording only needs camera + gripper width now), even
+    # though each row in matched_rows still carries them internally (used by
+    # apply_gripper_calibration to compute gripper_width_mm in the first
+    # place) -- extrasaction="ignore" lets DictWriter silently skip those
+    # extra keys instead of erroring on them.
     fieldnames = [
         "frame_id",
         "frame_host_time_ns",
         "servo_host_time_ns",
-        "sync_error_ms",
-        "position_deg",
-        "velocity_deg_s",
-        "current_ma",
+        "gripper_width_mm",
     ]
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(matched_rows)
 
@@ -451,10 +638,7 @@ def write_synced_csv(
         "accel_y",
         "accel_z",
         "accel_sync_error_ms",
-        "servo_position_deg",
-        "servo_velocity_deg_s",
-        "servo_current_ma",
-        "servo_sync_error_ms",
+        "servo_gripper_width_mm",
     ]
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -486,10 +670,7 @@ def write_synced_csv(
                         if accel
                         else None
                     ),
-                    "servo_position_deg": servo["position_deg"] if servo else None,
-                    "servo_velocity_deg_s": servo["velocity_deg_s"] if servo else None,
-                    "servo_current_ma": servo["current_ma"] if servo else None,
-                    "servo_sync_error_ms": servo["sync_error_ms"] if servo else None,
+                    "servo_gripper_width_mm": servo["gripper_width_mm"] if servo else None,
                 }
             )
 
@@ -550,6 +731,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--range-margin", type=float, default=servo_mod.GRIPPER_RANGE_MARGIN_DEG, dest="range_margin")
     parser.add_argument("--ignore-range-limit", action="store_true", dest="ignore_range_limit")
 
+    # Gripper calibration -- CSV mapping recorded servo angle to a physical
+    # gripper opening width (mm), on by default now that
+    # mapping_csv/mapping_function.csv exists. See load_gripper_calibration.
+    parser.add_argument("--gripper-calibration-csv", type=Path, default=DEFAULT_GRIPPER_CALIBRATION_CSV,
+                         dest="gripper_calibration_csv",
+                         help="CSV with columns gear_displacement (deg), gripper_displacement (mm) -- one row "
+                              f"per calibration point, any order. Default: {DEFAULT_GRIPPER_CALIBRATION_CSV} "
+                              "-- adds a gripper_width_mm column to servo.csv/synced.csv (linearly interpolated, "
+                              "clamped to the table's range) and shows the live width on the monitor window. "
+                              "Pass --no-gripper-calibration to skip this entirely.")
+    parser.add_argument("--no-gripper-calibration", dest="gripper_calibration_csv", action="store_const",
+                         const=None,
+                         help="Disable the gripper-width mapping (no gripper_width_mm column, no live readout).")
+    parser.add_argument("--gripper-calibration-offset-deg", type=float, default=GRIPPER_CALIBRATION_BIAS_DEG,
+                         dest="gripper_calibration_offset_deg",
+                         help=f"Deg added to every gear_displacement value in --gripper-calibration-csv so it "
+                              f"lines up with the servo's raw absolute reading. Default {GRIPPER_CALIBRATION_BIAS_DEG:.1f} "
+                              f"(measured 2026-08-19 for the current CSV/servo zero) -- re-measure and override "
+                              f"this if either changes.")
+    parser.add_argument("--gripper-max-width-mm", type=float, default=GRIPPER_MAX_WIDTH_MM,
+                         dest="gripper_max_width_mm",
+                         help=f"Real measured max gripper opening (mm) -- interpolated widths are capped at this "
+                              f"value, since the calibration CSV's kinematic model overshoots it near full-open. "
+                              f"Default {GRIPPER_MAX_WIDTH_MM:.1f} (measured 2026-08-19).")
+
     # Monitor -- one cv2 window: camera frame + servo position plot
     # composited side by side. See CombinedMonitor's docstring.
     parser.add_argument("--monitor", dest="monitor", action=argparse.BooleanOptionalAction, default=True,
@@ -560,12 +766,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--monitor-window", type=float, default=10.0, dest="monitor_window",
                          help="Seconds of servo-position history shown in the live plot at once.")
 
+    # Batch recording -- e.g. collecting N demonstrations for imitation
+    # learning back to back. See the episode loop in main().
+    parser.add_argument("--episodes", type=int, default=1, dest="episodes",
+                         help="Number of episodes to record in one session (default: 1, i.e. today's "
+                              "single-recording behavior). The camera connection and servo torque stay up "
+                              "the whole session -- only each episode's own state resets between episodes -- "
+                              "so episode 2 starts instantly instead of paying reconnect/re-home cost again. "
+                              "Each episode gets its own output folder and still needs its own Enter/Space "
+                              "to start and stop, since a human is doing a variable-length demonstration each "
+                              "time. Press q/Esc or close the monitor window to stop the whole batch early "
+                              "(a plain Enter/Space only ends the current episode and moves on to the next).")
+
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     rs = cam.import_realsense()
+
+    gripper_calib: tuple[np.ndarray, np.ndarray] | None = None
+    if args.gripper_calibration_csv is not None:
+        # Loaded, offset, and validated up front, before touching any
+        # hardware -- a malformed calibration CSV should fail fast, not
+        # after the servo's already been torqued on and a scan directory
+        # created. The CSV's own servo_position_deg column is in whatever
+        # frame it was measured in (e.g. starting from 0), while the servo
+        # reports raw absolute encoder degrees (read as signed -- see
+        # read_position_deg), so --gripper-calibration-offset-deg (a fixed,
+        # measured constant -- see GRIPPER_CALIBRATION_BIAS_DEG) shifts the
+        # table into that same raw frame.
+        raw_positions, widths = load_gripper_calibration(args.gripper_calibration_csv)
+        gripper_calib = (raw_positions + args.gripper_calibration_offset_deg, widths)
+        print(f"Loaded gripper calibration: {len(gripper_calib[0])} points from "
+              f"{args.gripper_calibration_csv}, offset {args.gripper_calibration_offset_deg:.1f} deg -> "
+              f"effective range {gripper_calib[0].min():.1f}-{gripper_calib[0].max():.1f} deg -> "
+              f"{gripper_calib[1].min():.1f}-{gripper_calib[1].max():.1f} mm")
 
     port = servo_mod.resolve_port(args.servo_port)
     servo = servo_mod.DynamixelPositionSpring(port, args.servo_baud, args.servo_id)
@@ -596,10 +832,17 @@ def main() -> int:
         print("Servo torque enabled.")
 
         args.data_dir.mkdir(parents=True, exist_ok=True)
-        scan_dir = cam.next_scan_dir(args.data_dir)
-        scan_dir.mkdir()
 
         requested_color = cam.optional_profile(args.color_width, args.color_height, args.color_fps, "color")
+
+        # First episode's folder has to exist before RealSenseCapture is
+        # constructed (scan_dir is baked in at construction time). Later
+        # episodes swap it out via capture.reset_for_new_episode instead of
+        # rebuilding the camera pipeline from scratch -- see that method's
+        # docstring for why a fresh pipeline.start() per episode is worth
+        # avoiding (it's the slow part; everything else resets cheaply).
+        scan_dir = cam.next_scan_dir(args.data_dir)
+        scan_dir.mkdir()
 
         capture = cam.RealSenseCapture(
             rs=rs,
@@ -620,22 +863,63 @@ def main() -> int:
             preview_fps=args.monitor_fps,
         )
 
+        # ServoPoller also stays up the whole session (own USB-paced thread,
+        # nothing scan_dir-specific about it) -- only poller.samples gets
+        # reset per episode, right before that episode starts recording.
         poller = ServoPoller(servo, capture.active)
         poller.start()
+
+        # Set by whichever comes first: Enter on the terminal, or Enter/Space
+        # in the monitor window (see CombinedMonitor's on_start_requested).
+        # Needed because the GUI window -- not the terminal -- has OS
+        # keyboard focus while you're actually looking at it, so a keystroke
+        # sent there never reached the terminal's stdin before this: pressing
+        # Enter "in the monitor window" looked exactly like the recording
+        # just never starting. Reassigned to a fresh Event each episode
+        # (below); on_stop_requested references it by name (same enclosing
+        # scope), not by value, so it always signals whichever episode's
+        # start_event is current -- see _on_monitor_closed's comment.
+        start_event = threading.Event()
+
+        # Distinct from a per-episode stop: q/Esc/closing the monitor window
+        # means "stop the whole batch", not just "end this one episode and
+        # prompt for the next" -- a plain Enter/Space (terminal or monitor)
+        # only ends the current episode.
+        abort_batch_event = threading.Event()
 
         if args.monitor:
             try:
                 cv2 = cam.import_opencv()
 
                 def _on_monitor_closed() -> None:
-                    print("\nMonitor window closed -- stopping.")
+                    print("\nMonitor window closed/q pressed -- stopping this episode and the batch.")
                     capture.stop_event.set()
+                    abort_batch_event.set()
+                    # Also unblocks a start_event.wait() if this fires while
+                    # still waiting for an episode to start (not yet
+                    # recording) -- without this, q/close before ever
+                    # pressing Enter would leave the script hanging forever
+                    # instead of actually stopping.
+                    start_event.set()
 
                 monitor = CombinedMonitor(
                     cv2,
                     window_seconds=args.monitor_window,
                     monitor_fps=args.monitor_fps,
                     on_stop_requested=_on_monitor_closed,
+                    gripper_calib=gripper_calib,
+                    gripper_max_width_mm=args.gripper_max_width_mm,
+                    on_start_requested=start_event.set,
+                    recording_active=capture.active,
+                    # Constant across episodes (unlike on_start_requested,
+                    # which gets rebound to a fresh per-episode Event below)
+                    # -- capture.stop_event itself gets swapped out each
+                    # episode by reset_for_new_episode, but this looks it up
+                    # fresh at call time via attribute access, so it always
+                    # targets whichever episode is currently running. Ends
+                    # just this episode, NOT the whole batch (that's
+                    # q/Esc/close, via on_stop_requested above).
+                    on_episode_stop_requested=lambda: capture.stop_event.set(),
                 )
                 monitor.start()
             except Exception as exc:
@@ -666,69 +950,138 @@ def main() -> int:
 
         capture.start_camera()
         capture.print_camera_summary()
-        cam.write_calibration(rs, capture.profile, scan_dir / "calibration.json", args.depth_flag)
-
-        print(f"\nOutput folder: {scan_dir}")
         print(f"Servo poll thread running (target: as fast as the USB link allows).")
-        input("Press Enter to start capture...")
+        if args.episodes > 1:
+            print(f"\nBatch mode: recording up to {args.episodes} episodes. Press q/Esc or close the "
+                  f"monitor window at any point to stop the whole batch early.")
 
-        def _wait_for_stop() -> None:
-            input("Recording... press Enter to stop.\n")
-            capture.stop_event.set()
+        episode_results: list[dict[str, Any]] = []
 
-        stop_thread = threading.Thread(target=_wait_for_stop, daemon=True)
-        stop_thread.start()
+        for episode_idx in range(1, args.episodes + 1):
+            if episode_idx > 1:
+                scan_dir = cam.next_scan_dir(args.data_dir)
+                scan_dir.mkdir()
+                capture.reset_for_new_episode(scan_dir)
+                with poller.lock:
+                    poller.samples = []
 
-        capture_result = capture.capture()
+            # Written into every episode's own folder (cheap -- unlike the
+            # camera pipeline, this doesn't need to be shared/reused) so
+            # each output folder is self-contained on its own, same as
+            # today's single-episode behavior.
+            cam.write_calibration(rs, capture.profile, scan_dir / "calibration.json", args.depth_flag)
+
+            start_event = threading.Event()
+            if monitor is not None:
+                monitor.on_start_requested = start_event.set
+
+            print(f"\n=== Episode {episode_idx}/{args.episodes} -- output: {scan_dir} ===")
+            print("Press Enter to start capture (in this terminal, or in the monitor window if it has focus)...")
+
+            def _wait_for_terminal_enter(event: threading.Event = start_event) -> None:
+                try:
+                    input()
+                except EOFError:
+                    pass  # stdin closed (e.g. non-interactive run) -- fall back to the monitor keypress only
+                event.set()
+
+            threading.Thread(target=_wait_for_terminal_enter, daemon=True).start()
+            start_event.wait()
+
+            if abort_batch_event.is_set():
+                print("Batch stopped before this episode started recording.")
+                break
+
+            def _wait_for_stop(event: threading.Event = capture.stop_event) -> None:
+                input("Recording... press Enter to stop.\n")
+                event.set()
+
+            threading.Thread(target=_wait_for_stop, daemon=True).start()
+
+            capture_result = capture.capture()
+
+            poller_error = poller.error  # snapshot -- poller keeps running/retrying into the next episode
+            if poller_error is not None:
+                print(f"\nWarning: servo poller hit an error during this episode: {poller_error}")
+
+            gyro_matched = cam.match_samples_to_frames(capture.frame_rows, capture.gyro_rows)
+            accel_matched = cam.match_samples_to_frames(capture.frame_rows, capture.accel_rows)
+            servo_matched = match_servo_to_frames(capture.frame_rows, poller.samples)
+            apply_gripper_calibration(servo_matched, gripper_calib, args.gripper_max_width_mm)
+
+            write_servo_csv(scan_dir / "servo.csv", servo_matched)
+            write_synced_csv(scan_dir / "synced.csv", capture.frame_rows, gyro_matched, accel_matched, servo_matched)
+
+            print(f"\nServo poll rate achieved: {poller.achieved_hz:.1f} Hz "
+                  f"({len(poller.samples)} samples recorded during the active window)")
+            print("Sync quality (camera frame vs. matched sample):")
+            summarize_sync("servo", servo_matched)
+
+            metadata_path = scan_dir / "metadata.json"
+            metadata: dict[str, Any] = {}
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_text())
+            metadata.update(
+                {
+                    "script": Path(__file__).name,
+                    "episode_index": episode_idx,
+                    "episodes_requested": args.episodes,
+                    "servo": {
+                        "port": port,
+                        "baud": args.servo_baud,
+                        "id": args.servo_id,
+                        "p_gain": args.p_gain,
+                        "i_gain": args.i_gain,
+                        "d_gain": args.d_gain,
+                        "max_current_ma": args.max_current,
+                        "center_deg": center,
+                        "poll_rate_achieved_hz": poller.achieved_hz,
+                        "samples_recorded": len(poller.samples),
+                    },
+                    "gripper_calibration": (
+                        {
+                            "csv_path": str(args.gripper_calibration_csv),
+                            "num_points": len(gripper_calib[0]),
+                            # The fixed offset applied to the CSV's own (relative)
+                            # servo_position_deg column -- see
+                            # --gripper-calibration-offset-deg / GRIPPER_CALIBRATION_BIAS_DEG --
+                            # recorded here so a run can be audited even if the
+                            # default offset is later re-measured.
+                            "offset_deg": args.gripper_calibration_offset_deg,
+                            "max_width_mm": args.gripper_max_width_mm,
+                            "position_range_deg": [float(gripper_calib[0].min()), float(gripper_calib[0].max())],
+                            "width_range_mm": [float(gripper_calib[1].min()), float(gripper_calib[1].max())],
+                        }
+                        if gripper_calib is not None
+                        else None
+                    ),
+                    "color_fps_requested": args.color_fps,
+                }
+            )
+            cam.write_json(metadata_path, metadata)
+
+            print(f"Wrote: {scan_dir / 'servo.csv'}")
+            print(f"Wrote: {scan_dir / 'synced.csv'}  (one row per camera frame, all streams joined)")
+            print(f"Metadata: {metadata_path}")
+
+            episode_results.append({"scan_dir": scan_dir, "complete": bool(capture_result.get("complete"))})
+
+            if abort_batch_event.is_set():
+                print(f"\nBatch stopped after episode {episode_idx}/{args.episodes}.")
+                break
 
         if monitor is not None:
             monitor.close()
-
         poller.stop()
-        if poller.error is not None:
-            print(f"\nWarning: servo poller stopped early due to an error: {poller.error}")
 
-        gyro_matched = cam.match_samples_to_frames(capture.frame_rows, capture.gyro_rows)
-        accel_matched = cam.match_samples_to_frames(capture.frame_rows, capture.accel_rows)
-        servo_matched = match_servo_to_frames(capture.frame_rows, poller.samples)
+        if args.episodes > 1 or not episode_results:
+            completed = sum(1 for r in episode_results if r["complete"])
+            print(f"\nBatch summary: {len(episode_results)}/{args.episodes} episodes recorded "
+                  f"({completed} complete, {len(episode_results) - completed} incomplete).")
+            for r in episode_results:
+                print(f"  {'OK  ' if r['complete'] else 'WARN'} {r['scan_dir']}")
 
-        write_servo_csv(scan_dir / "servo.csv", servo_matched)
-        write_synced_csv(scan_dir / "synced.csv", capture.frame_rows, gyro_matched, accel_matched, servo_matched)
-
-        print(f"\nServo poll rate achieved: {poller.achieved_hz:.1f} Hz "
-              f"({len(poller.samples)} samples recorded during the active window)")
-        print("Sync quality (camera frame vs. matched sample):")
-        summarize_sync("servo", servo_matched)
-
-        metadata_path = scan_dir / "metadata.json"
-        metadata: dict[str, Any] = {}
-        if metadata_path.exists():
-            metadata = json.loads(metadata_path.read_text())
-        metadata.update(
-            {
-                "script": Path(__file__).name,
-                "servo": {
-                    "port": port,
-                    "baud": args.servo_baud,
-                    "id": args.servo_id,
-                    "p_gain": args.p_gain,
-                    "i_gain": args.i_gain,
-                    "d_gain": args.d_gain,
-                    "max_current_ma": args.max_current,
-                    "center_deg": center,
-                    "poll_rate_achieved_hz": poller.achieved_hz,
-                    "samples_recorded": len(poller.samples),
-                },
-                "color_fps_requested": args.color_fps,
-            }
-        )
-        cam.write_json(metadata_path, metadata)
-
-        print(f"\nWrote: {scan_dir / 'servo.csv'}")
-        print(f"Wrote: {scan_dir / 'synced.csv'}  (one row per camera frame, all streams joined)")
-        print(f"Metadata: {metadata_path}")
-
-        return 0 if capture_result.get("complete") else 1
+        return 0 if episode_results and all(r["complete"] for r in episode_results) else 1
 
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)

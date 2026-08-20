@@ -209,6 +209,35 @@ class RealSenseCapture:
         if self.pipeline is not None:
             self.pipeline.stop()
 
+    def reset_for_new_episode(self, scan_dir: Path) -> None:
+        """Reset per-recording state for another capture() call, WITHOUT
+        touching self.pipeline -- lets a multi-episode batch session (e.g.
+        collecting N demonstrations in a row) reuse the same already-opened
+        camera connection instead of paying pipeline.start()'s cost again
+        per episode. Only call this between capture() calls, never while
+        one is running (self.active must be clear).
+
+        capture() itself already resets self.frame_rows at its own start,
+        so that's not repeated here -- everything below is state capture()
+        does NOT reset on its own, because it was designed for a single
+        capture() call per instance:
+          - scan_dir: this episode's own output folder.
+          - stop_event: capture()'s main loop runs `while not
+            stop_event.is_set()`, so the previous episode's already-set
+            event would make the next capture() call return instantly.
+          - gyro_rows/accel_rows/counters: these only ever grow (appended
+            to by _frame_callback while active), so without this they'd
+            keep accumulating every prior episode's samples/counts,
+            corrupting per-episode IMU matching and frame_id numbering
+            (frame_id is drawn from counters.rgbd_saved).
+        """
+        self.scan_dir = scan_dir
+        self.stop_event = threading.Event()
+        with self.imu_lock:
+            self.gyro_rows = []
+            self.accel_rows = []
+        self.counters = CaptureCounters()
+
     def print_camera_summary(self) -> None:
         if self.profile is None:
             raise RuntimeError("Camera is not started")
