@@ -27,7 +27,10 @@ import numpy as np
 from PIL import Image
 
 
-DEFAULT_DATA_DIR = Path("/home/core/Desktop/recording")
+# /home/core/Desktop was a leftover from a different machine/username this repo
+# was originally developed on; this machine's user is "hakan" and recordings
+# have consistently landed under Desktop/umi/recording (scan_0001 onward).
+DEFAULT_DATA_DIR = Path("/home/hakan/Desktop/umi/recording")
 
 COLOR_PROFILES = (
     # 60fps first: this is the default frequency for this rig. Confirmed
@@ -44,6 +47,15 @@ COLOR_PROFILES = (
 )
 DEPTH_PROFILES = (
     (1280, 720, 30),
+    (848, 480, 30),
+    (640, 480, 30),
+)
+# Left/right infrared (stereo) profiles -- used for live/offline ORB-SLAM3
+# Stereo-Inertial tracking (see ORB_SLAM3/config/RealSense_D435i_ours.yaml,
+# measured at 848x480@60). 848x480 first for the same reason color is: it's
+# this rig's default/verified resolution.
+IR_PROFILES = (
+    (848, 480, 60),
     (848, 480, 30),
     (640, 480, 30),
 )
@@ -80,8 +92,12 @@ class RealSenseCapture:
         imu_fps: int,
         show_preview: bool,
         preview_fps: float,
+        record_ir: bool = False,
+        requested_ir: "VideoProfile | None" = None,
         on_frame: Callable[[int, int, Any], None] | None = None,
         on_preview_frame: Callable[[Any], None] | None = None,
+        on_imu_sample: Callable[[str, dict[str, Any]], None] | None = None,
+        on_stereo_frame: Callable[[int, int, Any, Any], None] | None = None,
     ) -> None:
         self.rs = rs
         self.scan_dir = scan_dir
@@ -94,6 +110,16 @@ class RealSenseCapture:
         # A raised exception here is swallowed (see _save_frameset) so a
         # flaky monitor/callback can never take down the actual recording.
         self.on_frame = on_frame
+        # Optional hook, called once per raw gyro/accel sample, right after
+        # it's appended to self.gyro_rows/self.accel_rows (see
+        # _record_motion_frame): on_imu_sample("gyro"|"accel", row). Unlike
+        # on_frame, this fires at the IMU's own native rate (e.g. ~200Hz), not
+        # once per camera frame -- e.g. for feeding a live VIO tracker (see
+        # openvins_bridge.py) that needs the full-rate stream, not the
+        # frame-matched one. Runs on whatever thread the RealSense SDK
+        # delivers motion frames on (see _frame_callback) -- same
+        # exception-swallowing caveat as on_frame applies.
+        self.on_imu_sample = on_imu_sample
         # Optional hook, called from _update_preview with a fresh RGB
         # ndarray -- UNLIKE on_frame, this fires regardless of recording
         # state (see _frame_callback), so a live view can show real camera
@@ -103,12 +129,24 @@ class RealSenseCapture:
         # you can get frames here without RealSenseCapture opening its own
         # cv2 window).
         self.on_preview_frame = on_preview_frame
+        # Optional hook, called synchronously (same thread as on_frame, right
+        # after on_frame fires for a given saved frame) with the left/right
+        # infrared images for that same frame_id: on_stereo_frame(frame_id,
+        # host_time_ns, left_gray_ndarray, right_gray_ndarray). Only fires
+        # when record_ir is True. Lets a live ORB-SLAM3 Stereo-Inertial
+        # tracker (see hardware_project/camera/orbslam_bridge.py) consume the
+        # rectified stereo pair directly, the same way on_imu_sample feeds a
+        # live VIO tracker its IMU stream. Same exception-swallowing caveat
+        # as on_frame/on_imu_sample applies (see _call_hook).
+        self.on_stereo_frame = on_stereo_frame
         self.max_duration_seconds = max_duration_seconds
         self.requested_color = requested_color
         self.requested_depth = requested_depth
+        self.requested_ir = requested_ir
         self.enable_imu = enable_imu
         self.record_rgb = record_rgb
         self.record_depth = record_depth
+        self.record_ir = record_ir
         self.queue_size = queue_size
         self.imu_fps = imu_fps
         self.show_preview = show_preview
@@ -130,7 +168,7 @@ class RealSenseCapture:
         self.start_mono_ns: int | None = None
 
     def start_camera(self) -> None:
-        attempts: list[tuple[VideoProfile, VideoProfile | None, bool]] = []
+        attempts: list[tuple[VideoProfile, VideoProfile | None, bool, VideoProfile | None]] = []
 
         color_profiles = (
             (self.requested_color,)
@@ -142,27 +180,43 @@ class RealSenseCapture:
             if self.requested_depth is not None
             else tuple(VideoProfile(*p) for p in DEPTH_PROFILES)
         )
+        # A single IR profile choice per attempt (not cross-producted with
+        # color/depth like those two are) -- keeps the attempt list from
+        # exploding combinatorially; if record_ir is False this is just
+        # (None,), i.e. no IR stream requested at all, same as before this
+        # feature existed.
+        ir_profiles: tuple[VideoProfile | None, ...] = (None,)
+        if self.record_ir:
+            ir_profiles = (
+                (self.requested_ir,)
+                if self.requested_ir is not None
+                else tuple(VideoProfile(*p) for p in IR_PROFILES)
+            )
 
         if self.record_depth:
             for color_profile in color_profiles:
                 for depth_profile in depth_profiles:
-                    attempts.append((color_profile, depth_profile, self.enable_imu))
+                    for ir_profile in ir_profiles:
+                        attempts.append((color_profile, depth_profile, self.enable_imu, ir_profile))
             if self.enable_imu:
                 for color_profile in color_profiles:
                     for depth_profile in depth_profiles:
-                        attempts.append((color_profile, depth_profile, False))
+                        for ir_profile in ir_profiles:
+                            attempts.append((color_profile, depth_profile, False, ir_profile))
         else:
             # Depth is not being saved, so skip the depth stream entirely: a
             # depth sensor that stalls can otherwise block color framesets too,
             # since the pipeline waits for both streams to sync.
             for color_profile in color_profiles:
-                attempts.append((color_profile, None, self.enable_imu))
+                for ir_profile in ir_profiles:
+                    attempts.append((color_profile, None, self.enable_imu, ir_profile))
             if self.enable_imu:
                 for color_profile in color_profiles:
-                    attempts.append((color_profile, None, False))
+                    for ir_profile in ir_profiles:
+                        attempts.append((color_profile, None, False, ir_profile))
 
         errors: list[str] = []
-        for color_profile, depth_profile, with_imu in attempts:
+        for color_profile, depth_profile, with_imu, ir_profile in attempts:
             self.pipeline = self.rs.pipeline()
             config = self.rs.config()
             config.enable_stream(
@@ -180,6 +234,13 @@ class RealSenseCapture:
                     self.rs.format.z16,
                     depth_profile.fps,
                 )
+            if ir_profile is not None:
+                config.enable_stream(
+                    self.rs.stream.infrared, 1, ir_profile.width, ir_profile.height, self.rs.format.y8, ir_profile.fps
+                )
+                config.enable_stream(
+                    self.rs.stream.infrared, 2, ir_profile.width, ir_profile.height, self.rs.format.y8, ir_profile.fps
+                )
             if with_imu:
                 config.enable_stream(self.rs.stream.gyro, self.rs.format.motion_xyz32f, self.imu_fps)
                 config.enable_stream(self.rs.stream.accel, self.rs.format.motion_xyz32f, self.imu_fps)
@@ -191,10 +252,11 @@ class RealSenseCapture:
                     self.rs.align(self.rs.stream.color) if depth_profile is not None else None
                 )
                 self.enable_imu = with_imu
+                self.record_ir = ir_profile is not None
                 return
             except Exception as exc:  # noqa: BLE001 - pyrealsense throws runtime errors
                 errors.append(
-                    f"color={color_profile} depth={depth_profile} imu={with_imu}: {exc}"
+                    f"color={color_profile} depth={depth_profile} imu={with_imu} ir={ir_profile}: {exc}"
                 )
                 try:
                     self.pipeline.stop()
@@ -248,6 +310,7 @@ class RealSenseCapture:
         print(f"  Serial: {safe_device_info(self.rs, device, self.rs.camera_info.serial_number)}")
         print(f"  Firmware: {safe_device_info(self.rs, device, self.rs.camera_info.firmware_version)}")
         print(f"  IMU enabled: {self.enable_imu}")
+        print(f"  IR (stereo) enabled: {self.record_ir}")
 
         streams = (
             (self.rs.stream.color, self.rs.stream.depth)
@@ -276,12 +339,17 @@ class RealSenseCapture:
         rgb_dir = self.scan_dir / "rgb"
         depth_dir = self.scan_dir / "depth"
         imu_dir = self.scan_dir / "imu"
+        ir_left_dir = self.scan_dir / "ir_left"
+        ir_right_dir = self.scan_dir / "ir_right"
         if self.record_rgb:
             rgb_dir.mkdir(parents=True, exist_ok=True)
         if self.record_depth:
             depth_dir.mkdir(parents=True, exist_ok=True)
         if self.enable_imu:
             imu_dir.mkdir(parents=True, exist_ok=True)
+        if self.record_ir:
+            ir_left_dir.mkdir(parents=True, exist_ok=True)
+            ir_right_dir.mkdir(parents=True, exist_ok=True)
 
         self.start_mono_ns = time.monotonic_ns()
         self.end_mono_ns = (
@@ -314,6 +382,8 @@ class RealSenseCapture:
                 self._drain_video_queue(
                     rgb_dir,
                     depth_dir,
+                    ir_left_dir,
+                    ir_right_dir,
                     frame_rows,
                     block_timeout=0.2,
                     max_items=1,
@@ -351,12 +421,12 @@ class RealSenseCapture:
         )
         capture_ended_at_wall = now_iso()
         print("Collection complete. You can stop moving/holding the camera; saving files now.")
-        self._drain_video_queue(rgb_dir, depth_dir, frame_rows, block_timeout=0.0)
+        self._drain_video_queue(rgb_dir, depth_dir, ir_left_dir, ir_right_dir, frame_rows, block_timeout=0.0)
         processing_ended_at_wall = now_iso()
 
         self._write_frame_indexes(frame_rows)
         if self.enable_imu:
-            self._write_imu_csvs(imu_dir, frame_rows)
+            self._write_imu_csvs(imu_dir)
 
         complete = not interrupted and self.counters.rgbd_saved > 0
         result = {
@@ -468,18 +538,28 @@ class RealSenseCapture:
             "z": float(motion.z),
         }
 
+        label: str | None = None
         with self.imu_lock:
             if stream_type == self.rs.stream.gyro:
                 self.gyro_rows.append(row)
                 self.counters.gyro_samples += 1
+                label = "gyro"
             elif stream_type == self.rs.stream.accel:
                 self.accel_rows.append(row)
                 self.counters.accel_samples += 1
+                label = "accel"
+
+        # Fired outside the lock (cheap/non-blocking contract, same as
+        # on_frame -- see this method's caller in _frame_callback).
+        if label is not None:
+            self._call_hook(self.on_imu_sample, label, row)
 
     def _drain_video_queue(
         self,
         rgb_dir: Path,
         depth_dir: Path,
+        ir_left_dir: Path,
+        ir_right_dir: Path,
         frame_rows: list[dict[str, Any]],
         block_timeout: float,
         max_items: int | None = None,
@@ -496,7 +576,7 @@ class RealSenseCapture:
                     return
                 frameset, host_time_ns = synced
             block_timeout = 0.0
-            self._save_frameset(frameset, host_time_ns, rgb_dir, depth_dir, frame_rows)
+            self._save_frameset(frameset, host_time_ns, rgb_dir, depth_dir, ir_left_dir, ir_right_dir, frame_rows)
             processed += 1
 
     def _next_synced_frameset(self, block_timeout: float) -> tuple[Any, int] | None:
@@ -539,6 +619,8 @@ class RealSenseCapture:
         host_time_ns: int,
         rgb_dir: Path,
         depth_dir: Path,
+        ir_left_dir: Path,
+        ir_right_dir: Path,
         frame_rows: list[dict[str, Any]],
     ) -> None:
         if self.align is not None:
@@ -560,6 +642,26 @@ class RealSenseCapture:
                 self.counters.incomplete_frames += 1
                 return
 
+        # Pulled from the original (pre-align) frameset, not `aligned` --
+        # rs2::align is specifically for color/depth registration and IR
+        # frames aren't part of what it aligns; the raw synced frameset
+        # already has them (or doesn't, if this particular frameset's sync
+        # window missed one side -- handled below by just leaving that
+        # frame_id's IR paths as None rather than failing the whole frame,
+        # since IR is a bonus stream for live/offline ORB-SLAM3, not this
+        # method's primary RGB-D contract).
+        ir_left_frame = None
+        ir_right_frame = None
+        if self.record_ir:
+            try:
+                left_candidate = frameset.get_infrared_frame(1)
+                right_candidate = frameset.get_infrared_frame(2)
+                if left_candidate and right_candidate:
+                    ir_left_frame = left_candidate
+                    ir_right_frame = right_candidate
+            except Exception:
+                pass
+
         frame_id = self.counters.rgbd_saved
         color_ts_s = float(color_frame.get_timestamp()) / 1000.0
         depth_ts_s = float(depth_frame.get_timestamp()) / 1000.0 if depth_frame is not None else None
@@ -572,6 +674,12 @@ class RealSenseCapture:
         if self.record_depth and depth_frame is not None:
             depth_name = f"{frame_id:06d}_{depth_ts_ns}.png"
             depth_rel = f"depth/{depth_name}"
+        ir_left_rel = None
+        ir_right_rel = None
+        if ir_left_frame is not None:
+            ir_name = f"{frame_id:06d}_{color_ts_ns}.png"
+            ir_left_rel = f"ir_left/{ir_name}"
+            ir_right_rel = f"ir_right/{ir_name}"
 
         if self.record_rgb:
             color = np.asanyarray(color_frame.get_data())
@@ -579,6 +687,13 @@ class RealSenseCapture:
         if self.record_depth and depth_frame is not None:
             depth = np.asanyarray(depth_frame.get_data())
             Image.fromarray(depth).save(depth_dir / depth_name, compress_level=1)
+        left_gray: np.ndarray | None = None
+        right_gray: np.ndarray | None = None
+        if ir_left_frame is not None:
+            left_gray = np.asanyarray(ir_left_frame.get_data())
+            right_gray = np.asanyarray(ir_right_frame.get_data())
+            Image.fromarray(left_gray, mode="L").save(ir_left_dir / ir_name, compress_level=1)
+            Image.fromarray(right_gray, mode="L").save(ir_right_dir / ir_name, compress_level=1)
 
         frame_rows.append(
             {
@@ -596,6 +711,8 @@ class RealSenseCapture:
                 "host_time_ns": host_time_ns,
                 "rgb_path": rgb_rel,
                 "depth_path": depth_rel,
+                "ir_left_path": ir_left_rel,
+                "ir_right_path": ir_right_rel,
                 "color_frame_number": int(color_frame.get_frame_number()),
                 "depth_frame_number": (
                     int(depth_frame.get_frame_number()) if depth_frame is not None else None
@@ -604,6 +721,8 @@ class RealSenseCapture:
         )
         self.counters.rgbd_saved += 1
         self._call_hook(self.on_frame, frame_id, host_time_ns, color if self.record_rgb else None)
+        if left_gray is not None:
+            self._call_hook(self.on_stereo_frame, frame_id, host_time_ns, left_gray, right_gray)
 
     def _write_frame_indexes(self, frame_rows: list[dict[str, Any]]) -> None:
         with (self.scan_dir / "frames.csv").open("w", newline="") as f:
@@ -618,6 +737,8 @@ class RealSenseCapture:
                 "host_time_ns",
                 "rgb_path",
                 "depth_path",
+                "ir_left_path",
+                "ir_right_path",
                 "color_frame_number",
                 "depth_frame_number",
             ]
@@ -639,10 +760,38 @@ class RealSenseCapture:
                         f"{row['depth_timestamp_seconds']:.9f} {row['depth_path']}\n"
                     )
 
-    def _write_imu_csvs(self, imu_dir: Path, frame_rows: list[dict[str, Any]]) -> None:
+        if self.record_ir:
+            # Same timestamp column as rgb.txt (color_timestamp_seconds) --
+            # IR/color are pulled from the same synced frameset, so they
+            # share a timestamp; rows with no IR that frame (ir_left_path is
+            # None) are skipped rather than writing a bogus path, mirroring
+            # EuRoC/TUM-style association files where every listed line has
+            # real data. See TUM/EuRoC "leftcam.txt"/"rightcam.txt" style
+            # index files used by offline ORB-SLAM3 processing.
+            with (self.scan_dir / "ir_left.txt").open("w") as f_left, (
+                self.scan_dir / "ir_right.txt"
+            ).open("w") as f_right:
+                f_left.write("# timestamp ir_left_path\n")
+                f_right.write("# timestamp ir_right_path\n")
+                for row in frame_rows:
+                    if row["ir_left_path"] is None:
+                        continue
+                    f_left.write(f"{row['color_timestamp_seconds']:.9f} {row['ir_left_path']}\n")
+                    f_right.write(f"{row['color_timestamp_seconds']:.9f} {row['ir_right_path']}\n")
+
+    def _write_imu_csvs(self, imu_dir: Path) -> None:
+        # Written at the IMU's own native sample rate (e.g. ~200Hz), NOT reduced
+        # to one row per camera frame -- these are raw motion-frame samples as
+        # they arrived, so there is no frame_id/frame_timestamp_seconds to
+        # attach (a given IMU sample isn't matched to any one frame). This used
+        # to run every row through match_samples_to_frames, which discarded all
+        # but the single nearest-to-each-frame sample before writing -- fine
+        # for a quick per-frame lookup, but it meant these files never actually
+        # captured the IMU at its requested rate. synced.csv still gets its
+        # own frame-matched gyro/accel columns independently (see
+        # synced_capture.py's write_synced_csv), so that per-frame convenience
+        # view is unaffected by this change.
         fieldnames = [
-            "frame_id",
-            "frame_timestamp_seconds",
             "frame_number",
             "timestamp_seconds",
             "rs_timestamp_ms",
@@ -657,11 +806,10 @@ class RealSenseCapture:
             accel_rows = list(self.accel_rows)
 
         for filename, rows in (("gyro.csv", gyro_rows), ("accel.csv", accel_rows)):
-            matched_rows = match_samples_to_frames(frame_rows, rows)
             with (imu_dir / filename).open("w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
-                writer.writerows(matched_rows)
+                writer.writerows(rows)
 
 
 def parse_args() -> argparse.Namespace:
@@ -700,12 +848,26 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Enable and record IMU gyro/accel samples (default: on). Use --no-imu-flag to skip.",
     )
+    parser.add_argument(
+        "--ir-flag",
+        dest="ir_flag",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable and record left/right infrared (stereo) images to "
+            "ir_left/ir_right, needed for offline/live ORB-SLAM3 Stereo-"
+            "Inertial processing (default: off, for backward compatibility)."
+        ),
+    )
     parser.add_argument("--color-width", type=int)
     parser.add_argument("--color-height", type=int)
     parser.add_argument("--color-fps", type=int, default=60)
     parser.add_argument("--depth-width", type=int)
     parser.add_argument("--depth-height", type=int)
     parser.add_argument("--depth-fps", type=int, default=30)
+    parser.add_argument("--ir-width", type=int)
+    parser.add_argument("--ir-height", type=int)
+    parser.add_argument("--ir-fps", type=int, default=60)
     parser.add_argument(
         "--imu-fps",
         type=int,
@@ -750,6 +912,7 @@ def main() -> int:
     requested_depth = optional_profile(
         args.depth_width, args.depth_height, args.depth_fps, "depth"
     )
+    requested_ir = optional_profile(args.ir_width, args.ir_height, args.ir_fps, "ir")
 
     capture = RealSenseCapture(
         rs=rs,
@@ -760,6 +923,8 @@ def main() -> int:
         enable_imu=args.imu_flag,
         record_rgb=args.rgb_flag,
         record_depth=args.depth_flag,
+        record_ir=args.ir_flag,
+        requested_ir=requested_ir,
         queue_size=args.queue_size,
         imu_fps=args.imu_fps,
         show_preview=args.preview,

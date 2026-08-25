@@ -100,6 +100,24 @@ sys.path.insert(0, str(REPO_ROOT / "servo"))
 
 import camera_collecting as cam  # noqa: E402
 import spring_position_mode as servo_mod  # noqa: E402
+from openvins_bridge import DEFAULT_LIB_PATH as OPENVINS_DEFAULT_LIB_PATH, OpenVinsTracker  # noqa: E402
+from orbslam_bridge import (  # noqa: E402
+    DEFAULT_LIB_PATH as ORBSLAM_DEFAULT_LIB_PATH,
+    DEFAULT_SETTINGS_PATH as ORBSLAM_DEFAULT_SETTINGS_PATH,
+    DEFAULT_VOCAB_PATH as ORBSLAM_DEFAULT_VOCAB_PATH,
+    OrbSlamTracker,
+)
+
+# Default OpenVINS estimator config for this rig's D435I -- see
+# open_vins/config/rs_d435i_umi/. Always overridable with --openvins-config.
+# OpenVINS (monocular) is now OFF by default (see --openvins) -- kept
+# available for side-by-side comparison/debugging, but ORB-SLAM3 (see
+# --orbslam) is the primary live tracker: empirical testing this project's
+# history showed OpenVINS drifts unboundedly under continuous handheld
+# motion with no pauses, a failure mode ORB-SLAM3's Stereo-Inertial mode
+# (real metric scale from the known IR baseline, not estimated online)
+# doesn't share.
+DEFAULT_OPENVINS_CONFIG = Path("/home/hakan/Desktop/umi/open_vins/config/rs_d435i_umi/estimator_config.yaml")
 
 # Default calibration table -- mapping_csv/mapping_function.csv, a 52-point
 # kinematic mapping (gear_displacement in deg -> gripper_displacement in mm)
@@ -229,6 +247,190 @@ class ServoPoller:
                 recording = "recording" if self.active_event.is_set() else "not recording yet"
                 print(f"\n[servo] {reads_attempted} reads, {self.achieved_hz:.1f} Hz, "
                       f"last position {angle:.2f} deg ({recording})")
+
+
+class OrbSlamWorker:
+    """Runs ORB-SLAM3 tracking on its own dedicated thread, always on the
+    MOST RECENTLY submitted stereo frame -- never a backlog, and drops
+    older frames if it's still busy when a newer one arrives.
+
+    Why this exists: per-frame tracking (feature extraction + local mapping
+    + loop closing, all running concurrently inside ORB-SLAM3) can take
+    longer than the camera's frame interval. RealSenseCapture's own
+    on_stereo_frame hook fires once per SAVED frame, in strict FIFO order,
+    from the same thread that drains its video_queue -- calling
+    tracker.track_stereo() synchronously from there (an earlier version of
+    this integration did exactly that) means that once tracking falls
+    behind real time, the backlog only grows: every subsequent frame is
+    tracked further and further behind when it was actually captured.
+    That's not just slow -- it starves ORB-SLAM3's internal IMU queue (the
+    frame's timestamp lags behind the live IMU stream that keeps arriving
+    in real time, so by the time a backlogged frame is tracked, most queued
+    IMU samples are already "in its future" and get skipped -- this is what
+    produced the near-constant "Empty IMU measurements vector!!!" warnings
+    in live testing) and, empirically, crashed ORB-SLAM3's IMU
+    initialization step consistently around 10s into two separate live
+    test runs. The stock stereo_inertial_realsense_D435i.cc example never
+    hits this: it has no queue at all, it just overwrites its one pending
+    frame slot and always tracks whatever's newest.
+
+    This class reproduces that same "always latest, drop if behind" model
+    for our live-feedback path specifically -- it does NOT affect what gets
+    saved to disk (frames.csv/ir_left.txt/ir_right.txt still get every
+    frame, from RealSenseCapture's own synchronous save path). Only the
+    live ORB-SLAM3 trajectory (camera_trajectory.csv) can end up with fewer
+    rows than there were saved frames, when tracking is running slower than
+    the camera -- each row is still a real, live-tracked pose (or an
+    honest is_lost=1), never a stale/backlogged one.
+
+    IMPORTANT, learned the hard way: "always latest" alone is NOT enough.
+    IMU keeps flowing into the tracker continuously in real time regardless
+    of how slow tracking is (see _on_imu_sample -- it's independent of this
+    worker). If a single track_stereo() call takes longer than the camera's
+    frame interval (and per-call cost tends to grow further as the map/
+    keyframe database grows, from concurrent local mapping + loop closing),
+    then by the time this worker finishes one call and grabs the next
+    "latest" pending frame, that frame's own timestamp is already stale
+    relative to how much IMU has meanwhile accumulated -- there's almost no
+    IMU left that's chronologically BEFORE it, which is what produced the
+    near-constant "Empty IMU measurements vector!!!" in live testing, and
+    ultimately crashed ORB-SLAM3's IMU initialization step. Confirmed via a
+    live diagnostic print in orb_capi.cc: the gap between a tracked frame's
+    timestamp and the newest IMU sample fed alongside it grew steadily
+    (multiple seconds within a couple seconds of wall-clock testing) even
+    after switching both sides to a single shared host clock, ruling out a
+    RealSense clock-domain mismatch and confirming this is genuine,
+    worsening processing lag. min_interval below (plus a lower
+    ORBextractor.nFeatures in the settings YAML) is the mitigation: give
+    each attempt a realistic time budget so tracking has a chance to
+    actually keep pace with the camera, rather than perpetually processing
+    something several seconds in the past.
+    """
+
+    def __init__(self, tracker: "OrbSlamTracker", on_pose, min_interval: float = 0.1):
+        self.tracker = tracker
+        self.on_pose = on_pose  # callback(timestamp, pose_tuple_or_None, map_epoch)
+        # Caps how often this worker will even ATTEMPT a track_stereo() call
+        # (default 10Hz) -- see the class docstring's "learned the hard way"
+        # note. This is distinct from "drop if busy": that alone still lets
+        # submissions get accepted as fast as the camera delivers them
+        # (~15-30Hz), which is more often than ORB-SLAM3 can realistically
+        # sustain per call on this hardware at the current feature count, so
+        # the "latest" pending frame was still routinely already stale by
+        # the time it got picked up. Throttling acceptance itself, not just
+        # processing, is what actually bounds that staleness.
+        #
+        # DO NOT lower this again without a lot more caution than "the
+        # whole-episode average call duration has headroom". A prior attempt
+        # measured avg=11ms/p95=17ms/max=37ms over one full episode
+        # (nFeatures=800) and, on that basis alone, tried 0.05 (20Hz) --
+        # which promptly reproduced the original crash (near-constant "Empty
+        # IMU measurements vector!!!" then a segfault, seconds into a fresh
+        # episode). Root cause: MAP INITIALIZATION (the first several frames
+        # of every fresh episode, before "New Map created" settles) is far
+        # more expensive per-call than steady-state tracking -- the
+        # accepted-frame gaps during that failed run were ~470ms apart, not
+        # the ~50ms the throttle should have allowed, meaning that startup
+        # spike alone was enough to fall behind and spiral, and the whole-
+        # episode average had completely hidden it (it gets diluted by many
+        # cheap steady-state calls afterward). 0.1 (10Hz) is the only value
+        # that has actually survived a live run without crashing during
+        # recording (proven across several episodes now) -- treat it as the
+        # floor, not a conservative guess to be optimized away. If revisiting
+        # this, look at stats_summary()'s max/p95 from just the first ~2s of
+        # a fresh episode specifically, not the whole-episode average.
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._pending: tuple[float, Any, Any] | None = None
+        self._last_submit_time = 0.0
+        self._stop_event = threading.Event()
+        # Timing instrumentation, added while investigating the ~80% tracking
+        # rate: cheap, in-process, printed as ONE summary line at close() --
+        # not a per-frame flood like the diagnostic already removed from
+        # orb_capi.cc. See the min_interval comment above for what it found.
+        self._call_durations: list[float] = []
+        self._call_gaps: list[float] = []
+        self._last_call_start: float | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, timestamp: float, left_gray: Any, right_gray: Any) -> None:
+        """Cheap, non-blocking -- called from RealSenseCapture's own capture-
+        draining thread on every stereo frame (see
+        _on_stereo_frame_for_orbslam in main()). Replaces whatever was
+        pending (superseding/dropping it if the worker thread hasn't picked
+        it up yet) -- UNLESS min_interval hasn't elapsed since the last
+        accepted submission, in which case this frame is ignored entirely
+        (see class docstring)."""
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_submit_time < self.min_interval:
+                return
+            self._last_submit_time = now
+            self._pending = (timestamp, left_gray, right_gray)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            with self._lock:
+                item = self._pending
+                self._pending = None
+            if item is None:
+                time.sleep(0.005)
+                continue
+            timestamp, left_gray, right_gray = item
+            call_start = time.monotonic()
+            if self._last_call_start is not None:
+                self._call_gaps.append(call_start - self._last_call_start)
+            self._last_call_start = call_start
+            pose = self.tracker.track_stereo(timestamp, left_gray, right_gray)
+            self._call_durations.append(time.monotonic() - call_start)
+            # last_map_epoch is updated by track_stereo() above regardless of
+            # whether tracking succeeded -- read it right after, same call
+            # ordering the C API guarantees atomicity for (see
+            # OrbSlamTracker.last_map_epoch's docstring).
+            self.on_pose(timestamp, pose, self.tracker.last_map_epoch)
+
+    def stats_summary(self) -> str:
+        """One-line timing summary -- see the instrumentation comment in
+        __init__. Safe to call any time; reports "no frames processed" if
+        called before the first track_stereo() call completes.
+
+        Reports the first 10 calls' durations SEPARATELY from the
+        whole-episode average -- see the min_interval comment in __init__
+        for why: map initialization (the first several frames of a fresh
+        episode) is far more expensive than steady-state tracking, and a
+        whole-episode average dilutes that spike away completely. Look at
+        this "startup" figure, not just the overall average, before ever
+        considering lowering min_interval again."""
+        if not self._call_durations:
+            return "ORB-SLAM3 timing: no frames processed"
+        startup = self._call_durations[:10]
+        parts = [
+            f"ORB-SLAM3 timing: startup (first {len(startup)} calls) max={max(startup)*1000:.0f}ms"
+        ]
+        d = sorted(self._call_durations)
+        mean_d = sum(d) / len(d)
+        p95_d = d[int(0.95 * (len(d) - 1))]
+        parts.append(
+            f"whole-episode ({len(d)} calls) avg={mean_d*1000:.0f}ms "
+            f"p95={p95_d*1000:.0f}ms max={d[-1]*1000:.0f}ms"
+        )
+        if self._call_gaps:
+            g = self._call_gaps
+            parts.append(
+                f"call-to-call gap avg={sum(g)/len(g)*1000:.0f}ms min={min(g)*1000:.0f}ms "
+                f"(min_interval floor={self.min_interval*1000:.0f}ms)"
+            )
+        return "; ".join(parts)
+
+    def close(self) -> None:
+        """Stops the worker thread. Does NOT close the underlying tracker --
+        caller closes that separately (same split as ServoPoller/servo).
+        Must be called (and joined) BEFORE closing/destroying the tracker
+        this worker holds a reference to, so no in-flight track_stereo call
+        can run against an already-destroyed handle."""
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
 
 
 class CombinedMonitor:
@@ -589,6 +791,42 @@ def apply_gripper_calibration(
         )
 
 
+def write_camera_trajectory_csv(path: Path, trajectory_rows: list[dict[str, Any]]) -> None:
+    """One row per tracked camera frame this episode -- used for both
+    trackers' output (see _on_stereo_frame_for_orbslam and
+    _on_frame_for_openvins in main()), just with different trajectory_rows
+    lists/output paths (see main()'s write step). Core schema
+    (timestamp,x,y,z,q_x,q_y,q_z,q_w,is_lost) matches what's used elsewhere
+    for VIO/SLAM trajectory output in this project (see
+    open_vins/ov_msckf/src/run_folder_vio.cpp), so downstream tooling can
+    treat a live-recorded episode the same as an offline-processed one,
+    regardless of which backend tracked it. is_lost=1 rows (before the
+    tracker has initialized, or after it lost tracking) carry all-zero
+    position/identity-ish quaternion placeholders, same convention as
+    run_folder_vio.cpp.
+
+    map_epoch (ORB-SLAM3 only, blank for OpenVINS -- no equivalent concept):
+    System::GetMapEpoch() as of that row, from OrbSlamTracker.last_map_epoch
+    (see its docstring). Two rows sharing the same map_epoch are in the same
+    coordinate frame; a map_epoch CHANGE between consecutive rows means
+    ORB-SLAM3 just reset in a way that can move the active map's pose origin
+    (observed live to happen multiple times per recording, not just at
+    startup -- e.g. "Not enough motion for initializing. Reseting..." or
+    "IMU is not or recently initialized. Reseting active map...") and the
+    poses on either side of that change must NOT be treated as one
+    continuous trajectory -- downstream consumers should split (or discard)
+    episodes at a map_epoch boundary rather than silently training across a
+    coordinate-frame teleport. NOT the active map's raw ID: live testing
+    showed the common reset path clears and re-initializes the SAME map
+    object in place (its own ID never changes even though the origin does)
+    -- see System.h's GetMapEpoch() doc comment for the full story."""
+    fieldnames = ["timestamp", "x", "y", "z", "q_x", "q_y", "q_z", "q_w", "is_lost", "map_epoch"]
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(trajectory_rows)
+
+
 def write_servo_csv(path: Path, matched_rows: list[dict[str, Any]]) -> None:
     # Only frame/timing (to keep this aligned with servo.csv's usual role as
     # a per-stream file matching gyro.csv/accel.csv) plus gripper_width_mm --
@@ -756,6 +994,49 @@ def parse_args() -> argparse.Namespace:
                               f"value, since the calibration CSV's kinematic model overshoots it near full-open. "
                               f"Default {GRIPPER_MAX_WIDTH_MM:.1f} (measured 2026-08-19).")
 
+    # Live ORB-SLAM3 (Stereo-Inertial) tracking -- see orbslam_bridge.py. This
+    # is the primary/default live tracker (see module-level comment above
+    # DEFAULT_OPENVINS_CONFIG for why). Needs stereo IR, so enabling this
+    # also turns on --ir-flag-equivalent stereo capture on RealSenseCapture
+    # (see record_ir=args.orbslam below) -- there's no separate --ir-flag
+    # here, since IR is only ever needed for ORB-SLAM3 in this script. Fed
+    # the full native-rate IMU stream (via on_imu_sample, paired
+    # nearest-gyro-to-accel same as OpenVINS's own fusion) and every stereo
+    # frame pair (via RealSenseCapture's on_stereo_frame hook). A fresh
+    # tracker is created per episode (System has no in-place reset exposed
+    # here -- see orbslam_bridge.py's docstring), so each episode's
+    # camera_trajectory.csv starts its own clean map/pose graph near t=0.
+    parser.add_argument("--orbslam", dest="orbslam", action=argparse.BooleanOptionalAction, default=True,
+                         help="Run live ORB-SLAM3 Stereo-Inertial tracking alongside recording (default: on, "
+                              "the primary live tracker -- see --openvins for the deprecated/comparison-only "
+                              "monocular alternative). Prints tracked position periodically and writes "
+                              "camera_trajectory.csv per episode. Also enables stereo IR capture (ir_left/ "
+                              "ir_right). Use --no-orbslam to skip entirely (e.g. if ORB_SLAM3 isn't built).")
+    parser.add_argument("--orbslam-settings", type=Path, default=ORBSLAM_DEFAULT_SETTINGS_PATH, dest="orbslam_settings",
+                         help=f"ORB-SLAM3 settings YAML (calibration) to use. Default: {ORBSLAM_DEFAULT_SETTINGS_PATH}")
+    parser.add_argument("--orbslam-vocab", type=Path, default=ORBSLAM_DEFAULT_VOCAB_PATH, dest="orbslam_vocab",
+                         help=f"ORB-SLAM3 vocabulary file. Default: {ORBSLAM_DEFAULT_VOCAB_PATH}")
+    parser.add_argument("--orbslam-lib", type=Path, default=ORBSLAM_DEFAULT_LIB_PATH, dest="orbslam_lib",
+                         help=f"Path to the built liborb_capi.so. Default: {ORBSLAM_DEFAULT_LIB_PATH}")
+    parser.add_argument("--orbslam-viewer", dest="orbslam_viewer", action=argparse.BooleanOptionalAction,
+                         default=False,
+                         help="Also launch ORB-SLAM3's own Pangolin 3D map viewer window (default: off -- "
+                              "this script's own --monitor window already gives live feedback; the Pangolin "
+                              "viewer is mainly for standalone debugging of tracking/map quality).")
+
+    # Live OpenVINS (monocular) tracking -- see openvins_bridge.py. Off by
+    # default now (see module-level comment above DEFAULT_OPENVINS_CONFIG);
+    # kept only for side-by-side comparison against --orbslam. When both are
+    # enabled, ORB-SLAM3's output is the canonical camera_trajectory.csv and
+    # OpenVINS's goes to camera_trajectory_openvins.csv instead (see main()).
+    parser.add_argument("--openvins", dest="openvins", action=argparse.BooleanOptionalAction, default=False,
+                         help="Also run live (monocular) OpenVINS tracking, for comparison against --orbslam "
+                              "(default: off). Use --no-orbslam --openvins to run OpenVINS alone, old-style.")
+    parser.add_argument("--openvins-config", type=Path, default=DEFAULT_OPENVINS_CONFIG, dest="openvins_config",
+                         help=f"OpenVINS estimator_config.yaml to use. Default: {DEFAULT_OPENVINS_CONFIG}")
+    parser.add_argument("--openvins-lib", type=Path, default=OPENVINS_DEFAULT_LIB_PATH, dest="openvins_lib",
+                         help=f"Path to the built libov_capi.so. Default: {OPENVINS_DEFAULT_LIB_PATH}")
+
     # Monitor -- one cv2 window: camera frame + servo position plot
     # composited side by side. See CombinedMonitor's docstring.
     parser.add_argument("--monitor", dest="monitor", action=argparse.BooleanOptionalAction, default=True,
@@ -810,6 +1091,9 @@ def main() -> int:
     # gets constructed.
     poller: ServoPoller | None = None
     monitor: CombinedMonitor | None = None
+    orb_tracker: OrbSlamTracker | None = None
+    orb_worker: OrbSlamWorker | None = None
+    ov_tracker: OpenVinsTracker | None = None
 
     try:
         start_angle = servo.read_position_deg()
@@ -853,6 +1137,13 @@ def main() -> int:
             enable_imu=True,
             record_rgb=True,
             record_depth=args.depth_flag,
+            # ORB-SLAM3 Stereo-Inertial needs left/right IR -- there's no
+            # separate --ir-flag on this script since IR is only ever needed
+            # here for --orbslam. requested_ir left as None (auto-negotiate
+            # from camera_collecting.py's IR_PROFILES) since --orbslam-settings'
+            # calibration was measured at that same auto-negotiated 848x480
+            # default (see ORB_SLAM3/config/RealSense_D435i_ours.yaml).
+            record_ir=args.orbslam,
             queue_size=args.queue_size,
             imu_fps=args.imu_fps,
             # Not using RealSenseCapture's own cv2 preview window -- Combined
@@ -887,9 +1178,14 @@ def main() -> int:
         # only ends the current episode.
         abort_batch_event = threading.Event()
 
+        # Needed for both the monitor window AND OpenVINS's RGB->gray
+        # conversion below -- imported once, up front, regardless of which
+        # one(s) are actually enabled, so --no-monitor --openvins still works.
+        cv2_module = cam.import_opencv() if (args.monitor or args.openvins or args.orbslam) else None
+
         if args.monitor:
             try:
-                cv2 = cam.import_opencv()
+                cv2 = cv2_module
 
                 def _on_monitor_closed() -> None:
                     print("\nMonitor window closed/q pressed -- stopping this episode and the batch.")
@@ -957,6 +1253,14 @@ def main() -> int:
 
         episode_results: list[dict[str, Any]] = []
 
+        # OpenVINS has no in-place reset (VioManager tracks continuously once
+        # built) -- a fresh tracker is created per episode below so each
+        # episode's camera_trajectory.csv starts its own clean init near t=0,
+        # matching how the offline run_folder_vio processes each scan folder
+        # independently. None across the whole batch if --no-openvins.
+        # (declared above the try block, alongside poller/monitor, so the
+        # finally clause can always safely close it)
+
         for episode_idx in range(1, args.episodes + 1):
             if episode_idx > 1:
                 scan_dir = cam.next_scan_dir(args.data_dir)
@@ -964,6 +1268,188 @@ def main() -> int:
                 capture.reset_for_new_episode(scan_dir)
                 with poller.lock:
                     poller.samples = []
+
+            # Worker closed (thread joined) BEFORE the tracker it wraps is
+            # closed/destroyed -- see OrbSlamWorker.close's docstring for why
+            # the ordering matters (no in-flight track_stereo against a freed
+            # handle).
+            if orb_worker is not None:
+                orb_worker.close()
+            if orb_tracker is not None:
+                orb_tracker.close()
+            orb_tracker = (
+                OrbSlamTracker(args.orbslam_settings, args.orbslam_vocab, args.orbslam_lib,
+                                use_viewer=args.orbslam_viewer)
+                if args.orbslam
+                else None
+            )
+            orb_trajectory: list[dict[str, Any]] = []
+            orb_last_print = [0.0]  # mutable box, see _on_orb_pose
+            orb_last_map_epoch: list[int | None] = [None]  # mutable box, see _on_orb_pose
+            orb_map_resets = [0]  # mutable box, see _on_orb_pose
+
+            def _on_orb_pose(
+                ts: float,
+                pose: tuple | None,
+                map_epoch: int,
+                trajectory: list[dict[str, Any]] = orb_trajectory,
+                last_print: list[float] = orb_last_print,
+                last_map_epoch: list[int | None] = orb_last_map_epoch,
+                map_resets: list[int] = orb_map_resets,
+            ) -> None:
+                # Runs on OrbSlamWorker's own thread, not the capture thread
+                # -- see that class's docstring. trajectory/last_print/
+                # last_map_epoch/map_resets are bound as defaults at
+                # definition time (same closure-capture pattern used
+                # throughout this per-episode block) so this always targets
+                # THIS episode's own state, even though a new
+                # OrbSlamWorker/tracker gets created fresh each episode.
+                #
+                # map_epoch changing between calls means ORB-SLAM3 just
+                # reset in a way that can move the active map's pose origin
+                # -- e.g. after "Not enough motion for initializing.
+                # Reseting..." or "IMU is not or recently initialized.
+                # Reseting active map..." -- observed live to happen
+                # MULTIPLE TIMES during a single ~20s recording, not just at
+                # startup. Poses before and after such a change are NOT in
+                # the same coordinate frame and must not be treated as a
+                # continuous trajectory -- recorded here (map_epoch column)
+                # rather than silently concatenated, so downstream
+                # processing can split/discard segments instead of training
+                # on a trajectory with invisible teleports in it. NOT simply
+                # "the active map's ID changed" -- see write_camera_trajectory_csv's
+                # map_epoch docstring for why a dedicated counter is needed
+                # (the common reset path clears and reuses the same map
+                # object, so its own ID never changes).
+                if last_map_epoch[0] is not None and map_epoch != last_map_epoch[0]:
+                    map_resets[0] += 1
+                    print(f"\n[orbslam] WARNING: map reset detected (map_epoch {last_map_epoch[0]} -> {map_epoch}) "
+                          f"at t={ts:.2f} -- trajectory is NOT continuous across this point")
+                last_map_epoch[0] = map_epoch
+                if pose is not None:
+                    x, y, z, qx, qy, qz, qw = pose
+                    trajectory.append(
+                        {"timestamp": ts, "x": x, "y": y, "z": z, "q_x": qx, "q_y": qy, "q_z": qz, "q_w": qw,
+                         "is_lost": 0, "map_epoch": map_epoch}
+                    )
+                    now = time.monotonic()
+                    if now - last_print[0] >= 1.0:
+                        last_print[0] = now
+                        print(f"\n[orbslam] t={ts:.2f}  pos = {x:.3f}, {y:.3f}, {z:.3f}")
+                else:
+                    trajectory.append(
+                        {"timestamp": ts, "x": 0.0, "y": 0.0, "z": 0.0, "q_x": 0.0, "q_y": 0.0, "q_z": 0.0, "q_w": 1.0,
+                         "is_lost": 1, "map_epoch": map_epoch}
+                    )
+
+            orb_worker = OrbSlamWorker(orb_tracker, _on_orb_pose) if orb_tracker is not None else None
+            # ORB-SLAM3's feed_imu wants one already-paired gyro+accel sample
+            # per call (unlike OpenVinsTracker, which does its own gyro/accel
+            # fusion internally) -- track the latest gyro reading here and
+            # pair it with each accel sample, same nearest-neighbor fusion
+            # run_realsense_vio.cpp/the stock D435i example both use for the
+            # D435I's two independent gyro/accel streams.
+            orb_last_gyro = [0.0, 0.0, 0.0]
+            orb_have_gyro = [False]
+
+            if ov_tracker is not None:
+                ov_tracker.close()
+            ov_tracker = OpenVinsTracker(args.openvins_config, args.openvins_lib) if args.openvins else None
+            ov_trajectory: list[dict[str, Any]] = []
+            ov_last_print = [0.0]  # mutable box, see _on_frame_for_openvins
+
+            def _on_imu_sample(
+                kind: str,
+                row: dict[str, Any],
+                ov: OpenVinsTracker | None = ov_tracker,
+                orb: OrbSlamTracker | None = orb_tracker,
+                last_gyro: list[float] = orb_last_gyro,
+                have_gyro: list[bool] = orb_have_gyro,
+            ) -> None:
+                if kind == "gyro":
+                    if ov is not None:
+                        ov.feed_imu_gyro(row["x"], row["y"], row["z"])
+                    last_gyro[0], last_gyro[1], last_gyro[2] = row["x"], row["y"], row["z"]
+                    have_gyro[0] = True
+                elif kind == "accel":
+                    if ov is not None:
+                        ov.feed_imu_accel(row["timestamp_seconds"], row["x"], row["y"], row["z"])
+                    if orb is not None and have_gyro[0]:
+                        # Host clock (time.time_ns(), captured the instant
+                        # this sample arrived), NOT row["timestamp_seconds"]
+                        # (RealSense's own per-sensor hardware timestamp) --
+                        # see _on_stereo_frame_for_orbslam's matching comment
+                        # for why: live testing found gyro/accel's hardware
+                        # timestamp advancing roughly 2x faster than color's
+                        # once IR streams were added alongside color+IMU,
+                        # i.e. they are not reliably on the same clock domain
+                        # in this stream combination. The host wall clock is
+                        # the one timeline every stream shares by
+                        # construction, same reasoning match_servo_to_frames
+                        # already uses for the servo (which has no hardware
+                        # clock in common with the camera at all).
+                        orb.feed_imu(
+                            row["host_time_ns"] / 1e9,
+                            last_gyro[0], last_gyro[1], last_gyro[2],
+                            row["x"], row["y"], row["z"],
+                        )
+
+            def _on_frame_for_openvins(
+                frame_id: int,
+                host_time_ns: int,
+                color: Any,
+                tracker: OpenVinsTracker | None = ov_tracker,
+                trajectory: list[dict[str, Any]] = ov_trajectory,
+                last_print: list[float] = ov_last_print,
+            ) -> None:
+                if tracker is None or color is None:
+                    return
+                ts = capture.frame_rows[-1]["color_timestamp_seconds"]
+                gray = cv2_module.cvtColor(color, cv2_module.COLOR_RGB2GRAY)
+                tracker.feed_camera_gray(ts, gray)
+                pose = tracker.get_pose()
+                if pose is not None:
+                    x, y, z, qx, qy, qz, qw = pose
+                    trajectory.append(
+                        {"timestamp": ts, "x": x, "y": y, "z": z, "q_x": qx, "q_y": qy, "q_z": qz, "q_w": qw,
+                         "is_lost": 0, "map_epoch": ""}  # no map-reset concept for OpenVINS -- see write_camera_trajectory_csv
+                    )
+                    now = time.monotonic()
+                    if now - last_print[0] >= 1.0:
+                        last_print[0] = now
+                        print(f"\n[openvins] t={ts:.2f}  pos = {x:.3f}, {y:.3f}, {z:.3f}")
+                else:
+                    trajectory.append(
+                        {"timestamp": ts, "x": 0.0, "y": 0.0, "z": 0.0, "q_x": 0.0, "q_y": 0.0, "q_z": 0.0, "q_w": 1.0,
+                         "is_lost": 1, "map_epoch": ""}
+                    )
+
+            def _on_stereo_frame_for_orbslam(
+                frame_id: int,
+                host_time_ns: int,
+                left_gray: Any,
+                right_gray: Any,
+                worker: OrbSlamWorker | None = orb_worker,
+            ) -> None:
+                # Cheap hand-off only -- see OrbSlamWorker's docstring for
+                # why actual tracking happens on its own thread instead of
+                # here (this runs on RealSenseCapture's capture-draining
+                # thread, which must stay fast: it also gates how quickly
+                # frames get saved to disk).
+                if worker is None:
+                    return
+                # Host clock, not color_timestamp_seconds -- see the matching
+                # comment in _on_imu_sample's accel branch. host_time_ns is
+                # captured once per frame in _save_frameset (camera_collecting.py),
+                # same value already used to sync the servo to frames, so
+                # this and the IMU feed above are now both on that one shared
+                # timeline.
+                ts = capture.frame_rows[-1]["host_time_ns"] / 1e9
+                worker.submit(ts, left_gray, right_gray)
+
+            capture.on_imu_sample = _on_imu_sample
+            capture.on_frame = _on_frame_for_openvins
+            capture.on_stereo_frame = _on_stereo_frame_for_orbslam
 
             # Written into every episode's own folder (cheap -- unlike the
             # camera pipeline, this doesn't need to be shared/reused) so
@@ -1000,6 +1486,18 @@ def main() -> int:
 
             capture_result = capture.capture()
 
+            # Drain OrbSlamWorker before reading orb_trajectory below: it
+            # runs on its own thread (see that class's docstring), so the
+            # very last submitted frame may still be mid-track_stereo() at
+            # the moment capture() returns. close() joins the thread (which
+            # finishes whatever's in flight before exiting its loop), so
+            # this guarantees orb_trajectory reflects every frame this
+            # worker ever got to. Safe to call here even though the top of
+            # the next loop iteration also calls it -- joining an
+            # already-stopped thread is a no-op.
+            if orb_worker is not None:
+                orb_worker.close()
+
             poller_error = poller.error  # snapshot -- poller keeps running/retrying into the next episode
             if poller_error is not None:
                 print(f"\nWarning: servo poller hit an error during this episode: {poller_error}")
@@ -1011,6 +1509,31 @@ def main() -> int:
 
             write_servo_csv(scan_dir / "servo.csv", servo_matched)
             write_synced_csv(scan_dir / "synced.csv", capture.frame_rows, gyro_matched, accel_matched, servo_matched)
+            # ORB-SLAM3 is the canonical camera_trajectory.csv whenever it ran
+            # (see module-level comment above DEFAULT_OPENVINS_CONFIG); when
+            # OpenVINS also ran (--openvins, comparison mode) it gets its own
+            # separate file instead of being silently dropped. If only
+            # OpenVINS ran (--no-orbslam --openvins), it takes over the
+            # canonical filename, preserving this script's old single-tracker
+            # behavior.
+            if orb_tracker is not None:
+                write_camera_trajectory_csv(scan_dir / "camera_trajectory.csv", orb_trajectory)
+                n_tracked = sum(1 for r in orb_trajectory if r["is_lost"] == 0)
+                print(f"ORB-SLAM3: {n_tracked}/{len(orb_trajectory)} frames tracked, "
+                      f"{orb_map_resets[0]} map reset(s) ({orb_map_resets[0] + 1} coordinate-frame segment(s)) "
+                      f"-> wrote {scan_dir / 'camera_trajectory.csv'}")
+                if orb_worker is not None:
+                    print(orb_worker.stats_summary())
+                if ov_tracker is not None:
+                    write_camera_trajectory_csv(scan_dir / "camera_trajectory_openvins.csv", ov_trajectory)
+                    n_tracked_ov = sum(1 for r in ov_trajectory if r["is_lost"] == 0)
+                    print(f"OpenVINS (comparison): {n_tracked_ov}/{len(ov_trajectory)} frames tracked "
+                          f"-> wrote {scan_dir / 'camera_trajectory_openvins.csv'}")
+            elif ov_tracker is not None:
+                write_camera_trajectory_csv(scan_dir / "camera_trajectory.csv", ov_trajectory)
+                n_tracked = sum(1 for r in ov_trajectory if r["is_lost"] == 0)
+                print(f"OpenVINS: {n_tracked}/{len(ov_trajectory)} frames tracked "
+                      f"-> wrote {scan_dir / 'camera_trajectory.csv'}")
 
             print(f"\nServo poll rate achieved: {poller.achieved_hz:.1f} Hz "
                   f"({len(poller.samples)} samples recorded during the active window)")
@@ -1056,6 +1579,35 @@ def main() -> int:
                         else None
                     ),
                     "color_fps_requested": args.color_fps,
+                    "orbslam": (
+                        {
+                            "settings_path": str(args.orbslam_settings),
+                            "vocab_path": str(args.orbslam_vocab),
+                            "frames_tracked": sum(1 for r in orb_trajectory if r["is_lost"] == 0),
+                            "frames_total": len(orb_trajectory),
+                            "trajectory_path": "camera_trajectory.csv",
+                            # See write_camera_trajectory_csv's map_epoch docstring: a map
+                            # reset means the trajectory has >1 coordinate frame spliced
+                            # together under one file. 0 resets = camera_trajectory.csv
+                            # is one continuous coordinate frame throughout.
+                            "map_resets": orb_map_resets[0],
+                            "map_segments": orb_map_resets[0] + 1,
+                        }
+                        if orb_tracker is not None
+                        else None
+                    ),
+                    "openvins": (
+                        {
+                            "config_path": str(args.openvins_config),
+                            "frames_tracked": sum(1 for r in ov_trajectory if r["is_lost"] == 0),
+                            "frames_total": len(ov_trajectory),
+                            "trajectory_path": (
+                                "camera_trajectory_openvins.csv" if orb_tracker is not None else "camera_trajectory.csv"
+                            ),
+                        }
+                        if ov_tracker is not None
+                        else None
+                    ),
                 }
             )
             cam.write_json(metadata_path, metadata)
@@ -1091,6 +1643,12 @@ def main() -> int:
             poller.stop()
         if monitor is not None:
             monitor.close()
+        if orb_worker is not None:
+            orb_worker.close()
+        if orb_tracker is not None:
+            orb_tracker.close()
+        if ov_tracker is not None:
+            ov_tracker.close()
         servo.close()
         print("Servo torque disabled, port closed.")
 
