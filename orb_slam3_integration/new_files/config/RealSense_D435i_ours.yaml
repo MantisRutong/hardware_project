@@ -1,0 +1,110 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Stereo-Inertial calibration for this specific RealSense D435I unit (serial 346222071398).
+# All values below were measured live from the physical device via `rs-enumerate-devices -c`
+# (not assumed/borrowed) and independently cross-checked against a prior calibration file
+# from an earlier session for this same camera
+# (~/projects/diffusion_policy/data/umi_processed_scene003/d435i_orbslam3.yaml) - every
+# value matched exactly, confirming both that it's the same physical unit and that the
+# IMU.T_b_c1 direction convention below is correct (see notes at that field).
+#--------------------------------------------------------------------------------------------
+
+File.version: "1.0"
+
+Camera.type: "Rectified"
+
+# Left IR camera (Infrared 1) intrinsics at 848x480, from:
+#   rs-enumerate-devices -c -> Intrinsic of "Infrared 1" / 848x480 / {Y8}
+# Distortion coeffs are all zero (RealSense IR streams are already rectified).
+Camera1.fx: 427.689483642578
+Camera1.fy: 427.689483642578
+Camera1.cx: 422.894805908203
+Camera1.cy: 241.134582519531
+
+# Stereo baseline (meters), from:
+#   rs-enumerate-devices -c -> Extrinsic from "Infrared 1" To "Infrared 2"
+#   Translation Vector: -0.0498474463820457 0 0  (magnitude used here)
+# Matches the D435I's ~50mm spec baseline.
+Stereo.b: 0.0498474463820457
+
+# Camera resolution/rate for the Infrared 1/2 streams
+Camera.width: 848
+Camera.height: 480
+Camera.fps: 60
+
+# Color order of the images (0: BGR, 1: RGB. Ignored for grayscale IR streams).
+Camera.RGB: 1
+
+# Close/Far threshold. Baseline times.
+Stereo.ThDepth: 40.0
+
+# Transformation from body-frame (IMU/gyro) to left camera (Infrared 1).
+# From: rs-enumerate-devices -c -> Extrinsic from "Infrared 1" To "Gyro"
+#   Rotation Matrix: identity
+#   Translation Vector: -0.00552000012248755  0.00510000018402934  0.011739999987185
+# NOTE on direction: ORB-SLAM3 names this "body to camera1" but the values that are
+# numerically correct here are the "Infrared 1 To Gyro" extrinsic as reported by
+# RealSense (not "Gyro To Infrared 1", which has the opposite-signed translation) -
+# confirmed by exact match against the known-working reference file for this same
+# camera. Getting this backwards would inject a small but persistent systematic bias -
+# exactly the class of bug that caused hours of drift-debugging with OpenVINS earlier
+# this session - so this was verified against a second independent source, not just
+# derived once and assumed correct.
+IMU.T_b_c1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: f
+   data: [1.0, 0.0, 0.0, -0.00552000012248755,
+          0.0, 1.0, 0.0, 0.00510000018402934,
+          0.0, 0.0, 1.0, 0.011739999987185,
+          0.0, 0.0, 0.0, 1.0]
+
+# Do not insert KFs when recently lost
+IMU.InsertKFsWhenLost: 0
+
+# IMU noise - borrowed from VINS-mono defaults (same as the ORB-SLAM3 stock
+# RealSense_D435i.yaml example and the prior reference file for this camera), not a
+# device-specific Allan-variance calibration. Reasonable starting point, not exact -
+# same caveat that applied to the D455-borrowed noise values used for the OpenVINS
+# config earlier this session.
+IMU.NoiseGyro: 1e-3
+IMU.NoiseAcc: 1e-2
+IMU.GyroWalk: 1e-6
+IMU.AccWalk: 1e-4
+IMU.Frequency: 200.0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+# Lowered from 1600 (2026-08-25): live testing on this machine showed
+# per-frame tracking (feature extraction + local mapping + loop closing, all
+# concurrent) unable to sustain real time against a live ~30fps camera feed,
+# with per-call latency growing further as the map/keyframe database grew --
+# by the time a frame got tracked its timestamp was already multiple seconds
+# stale relative to the IMU stream (which keeps flowing in real time
+# regardless), starving ORB-SLAM3's internal IMU windowing (near-constant
+# "Empty IMU measurements vector!!!") and eventually crashing during IMU
+# initialization. Fewer features directly cuts tracking-thread CPU cost.
+# See also OrbSlamWorker's submission throttle in synced_capture.py, which
+# addresses the same root cause from the other side (attempt tracking less
+# often, not just cheaper).
+ORBextractor.nFeatures: 800
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 15
+ORBextractor.minThFAST: 5
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0

@@ -1,0 +1,221 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 016e743..ebf877a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,12 +14,12 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+ 
+ # Check C++11 or C++0x support
+ include(CheckCXXCompilerFlag)
+-CHECK_CXX_COMPILER_FLAG("-std=c++11" COMPILER_SUPPORTS_CXX11)
++CHECK_CXX_COMPILER_FLAG("-std=c++14" COMPILER_SUPPORTS_CXX11)
+ CHECK_CXX_COMPILER_FLAG("-std=c++0x" COMPILER_SUPPORTS_CXX0X)
+ if(COMPILER_SUPPORTS_CXX11)
+-   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
++   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
+    add_definitions(-DCOMPILEDWITHC11)
+-   message(STATUS "Using flag -std=c++11.")
++   message(STATUS "Using flag -std=c++14.")
+ elseif(COMPILER_SUPPORTS_CXX0X)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++0x")
+    add_definitions(-DCOMPILEDWITHC0X)
+@@ -125,6 +125,14 @@ ${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so
+ -lcrypto
+ )
+ 
++# orb_capi: minimal C-linkage wrapper around System (Stereo-Inertial), for
++# embedding a live ORB-SLAM3 session inside another process (e.g. driven via
++# Python ctypes - see hardware_project/camera/orbslam_bridge.py). Unconditional
++# (no realsense2 dependency, unlike the Examples below) - mirrors how
++# open_vins/ov_msckf builds its own ov_capi target the same way.
++add_library(orb_capi SHARED src/orb_capi.cc include/orb_capi.h)
++target_link_libraries(orb_capi ${PROJECT_NAME})
++
+ # If RealSense SDK is found the library is added and its examples compiled
+ if(realsense2_FOUND)
+     include_directories(${PROJECT_NAME}
+diff --git a/Examples/Monocular-Inertial/mono_inertial_euroc.cc b/Examples/Monocular-Inertial/mono_inertial_euroc.cc
+index b9f320f..bff32b2 100644
+--- a/Examples/Monocular-Inertial/mono_inertial_euroc.cc
++++ b/Examples/Monocular-Inertial/mono_inertial_euroc.cc
+@@ -117,7 +117,7 @@ int main(int argc, char *argv[])
+     cout.precision(17);
+ 
+     // Create SLAM system. It initializes all system threads and gets ready to process frames.
+-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::IMU_MONOCULAR, true);
++    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::IMU_MONOCULAR, false);
+     float imageScale = SLAM.GetImageScale();
+ 
+     double t_resize = 0.f;
+diff --git a/Examples/Stereo-Inertial/stereo_inertial_realsense_D435i.cc b/Examples/Stereo-Inertial/stereo_inertial_realsense_D435i.cc
+index d3a03bf..557729c 100644
+--- a/Examples/Stereo-Inertial/stereo_inertial_realsense_D435i.cc
++++ b/Examples/Stereo-Inertial/stereo_inertial_realsense_D435i.cc
+@@ -159,8 +159,12 @@ int main(int argc, char **argv) {
+     rs2::pipeline pipe;
+     // Create a configuration for configuring the pipeline with a non default profile
+     rs2::config cfg;
+-    cfg.enable_stream(RS2_STREAM_INFRARED, 1, 640, 480, RS2_FORMAT_Y8, 30);
+-    cfg.enable_stream(RS2_STREAM_INFRARED, 2, 640, 480, RS2_FORMAT_Y8, 30);
++    // 848x480 @ 60fps to match our measured/verified RealSense_D435i_ours.yaml
++    // calibration (Camera1.fx/fy/cx/cy were measured at 848x480, not the stock
++    // example's original 640x480 - using the wrong resolution here would silently
++    // apply the wrong intrinsics to the actual image content).
++    cfg.enable_stream(RS2_STREAM_INFRARED, 1, 848, 480, RS2_FORMAT_Y8, 60);
++    cfg.enable_stream(RS2_STREAM_INFRARED, 2, 848, 480, RS2_FORMAT_Y8, 60);
+     cfg.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F);
+     cfg.enable_stream(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F);
+ 
+@@ -442,6 +446,16 @@ int main(int argc, char **argv) {
+         // Clear the previous IMU measurements to load the new ones
+         vImuMeas.clear();
+     }
++
++    // Stop all threads and (if a trajectory_file_name was given on the command line)
++    // save the tracked trajectory in TUM format (timestamp x y z qx qy qz qw) - the
++    // "trajectory_file_name" argument was already parsed above (see file_name / the
++    // usage message) but was never actually wired to a save call in the stock example.
++    SLAM.Shutdown();
++    if (!file_name.empty()) {
++        SLAM.SaveTrajectoryTUM(file_name);
++        cout << "Trajectory saved to " << file_name << endl;
++    }
+     cout << "System shutdown!\n";
+ }
+ 
+diff --git a/Examples/Stereo/stereo_euroc.cc b/Examples/Stereo/stereo_euroc.cc
+index 1250f2e..b3df31f 100644
+--- a/Examples/Stereo/stereo_euroc.cc
++++ b/Examples/Stereo/stereo_euroc.cc
+@@ -88,7 +88,9 @@ int main(int argc, char **argv)
+     cout.precision(17);
+ 
+     // Create SLAM system. It initializes all system threads and gets ready to process frames.
+-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::STEREO, true);
++    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::STEREO, false);
++    if(std::getenv("ORB_SLAM_LOCALIZATION_ONLY") != nullptr)
++        SLAM.ActivateLocalizationMode();
+ 
+     cv::Mat imLeft, imRight;
+     for (seq = 0; seq<num_seq; seq++)
+diff --git a/include/Atlas.h b/include/Atlas.h
+index e1e2717..8076d76 100644
+--- a/include/Atlas.h
++++ b/include/Atlas.h
+@@ -139,6 +139,18 @@ public:
+ 
+     long unsigned int GetNumLivedMP();
+ 
++    // Local addition (not upstream, see orb_capi.cc): a counter bumped by
++    // BOTH CreateNewMap() and clearMap(). GetCurrentMap()->GetId() alone is
++    // NOT a reliable "did the active map's pose origin just change" signal:
++    // clearMap() (used by Tracking::ResetActiveMap(), the path actually
++    // taken by both the "Not enough motion for initializing" and "IMU is
++    // not or recently initialized" resets seen in live testing) clears and
++    // re-initializes the SAME Map object in place, so its mnId never
++    // changes, even though every point/keyframe was just discarded and
++    // tracking restarts from a fresh origin. This counter changes on every
++    // reset that can affect the pose origin, regardless of which path.
++    long unsigned int GetResetGeneration();
++
+ protected:
+ 
+     std::set<Map*> mspMaps;
+@@ -152,6 +164,9 @@ protected:
+ 
+     unsigned long int mnLastInitKFidMap;
+ 
++    // Local addition (not upstream) -- see GetResetGeneration()'s doc comment.
++    long unsigned int mnResetGeneration = 0;
++
+     Viewer* mpViewer;
+     bool mHasViewer;
+ 
+diff --git a/include/System.h b/include/System.h
+index 872c86e..26c9b2b 100644
+--- a/include/System.h
++++ b/include/System.h
+@@ -177,6 +177,23 @@ public:
+     std::vector<MapPoint*> GetTrackedMapPoints();
+     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
+ 
++    // Local addition (not upstream, see orb_capi.cc): a counter that changes
++    // every time ORB-SLAM3 resets in a way that can move the active map's
++    // pose origin -- e.g. after "Not enough motion for initializing.
++    // Reseting..." or "IMU is not or recently initialized. Reseting active
++    // map..." during Stereo-Inertial tracking -- without that being visible
++    // through GetTrackingState() (which reports OK either way once tracking
++    // resumes on the reset map). Comparing this value across calls is how a
++    // caller detects "the poses before and after this frame are NOT in the
++    // same coordinate frame, don't treat them as continuous". Backed by
++    // Atlas::GetResetGeneration() rather than the active map's own ID
++    // (Map::GetId()) because live testing showed the common reset path
++    // (Tracking::ResetActiveMap(), Atlas::clearMap()) clears and
++    // re-initializes the SAME Map object in place -- its ID never changes
++    // even though the origin does -- see Atlas.h's doc comment for the
++    // full story.
++    long unsigned int GetMapEpoch();
++
+     // For debugging
+     double GetTimeFromIMUInit();
+     bool isLost();
+diff --git a/src/Atlas.cc b/src/Atlas.cc
+index 7bdea06..c413415 100644
+--- a/src/Atlas.cc
++++ b/src/Atlas.cc
+@@ -74,6 +74,7 @@ void Atlas::CreateNewMap()
+     mpCurrentMap = new Map(mnLastInitKFidMap);
+     mpCurrentMap->SetCurrentMap();
+     mspMaps.insert(mpCurrentMap);
++    mnResetGeneration++;  // see GetResetGeneration()'s doc comment in Atlas.h
+ }
+ 
+ void Atlas::ChangeMap(Map* pMap)
+@@ -231,6 +232,13 @@ void Atlas::clearMap()
+ {
+     unique_lock<mutex> lock(mMutexAtlas);
+     mpCurrentMap->clear();
++    mnResetGeneration++;  // see GetResetGeneration()'s doc comment in Atlas.h
++}
++
++long unsigned int Atlas::GetResetGeneration()
++{
++    unique_lock<mutex> lock(mMutexAtlas);
++    return mnResetGeneration;
+ }
+ 
+ void Atlas::clearAtlas()
+diff --git a/src/Settings.cc b/src/Settings.cc
+index 93a50be..b26afad 100644
+--- a/src/Settings.cc
++++ b/src/Settings.cc
+@@ -550,7 +550,10 @@ namespace ORB_SLAM3 {
+             output << " ]" << endl;
+         }
+ 
+-        if(settings.sensor_ == System::STEREO || settings.sensor_ == System::IMU_STEREO){
++        // A Rectified stereo configuration intentionally has one shared
++        // pinhole calibration plus Stereo.b; originalCalib2_ is null.
++        if((settings.sensor_ == System::STEREO || settings.sensor_ == System::IMU_STEREO) &&
++           settings.cameraType_ != Settings::Rectified){
+             output << "\t-Camera 2 parameters (";
+             if(settings.cameraType_ == Settings::PinHole || settings.cameraType_ ==  Settings::Rectified){
+                 output << "Pinhole";
+diff --git a/src/System.cc b/src/System.cc
+index 60d9c51..b696dbb 100644
+--- a/src/System.cc
++++ b/src/System.cc
+@@ -1324,6 +1324,14 @@ int System::GetTrackingState()
+     return mTrackingState;
+ }
+ 
++long unsigned int System::GetMapEpoch()
++{
++    // Atlas::GetResetGeneration() takes its own internal mutex -- safe to
++    // call any time, no separate locking needed here (see System.h's and
++    // Atlas.h's comments on this).
++    return mpAtlas->GetResetGeneration();
++}
++
+ vector<MapPoint*> System::GetTrackedMapPoints()
+ {
+     unique_lock<mutex> lock(mMutexState);
