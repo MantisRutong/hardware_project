@@ -136,13 +136,23 @@ DEFAULT_GRIPPER_CALIBRATION_CSV = REPO_ROOT / "mapping_csv" / "mapping_function.
 # Bias (deg) between the calibration CSV's own zero point
 # (gear_displacement=0, the fully-closed end) and the servo's raw absolute
 # reading at that same physical end stop. gear_displacement=0 IS the
-# fully-closed position (gripper_displacement there is ~0mm). Close to but
-# not exactly GRIPPER_CLOSED_DEG (216.9) -- set to 221 deg per live testing
-# on 2026-08-19 (observed raw range 225-323 deg while running -- 221 was
-# picked as the calibrated closed-end reference over 216.9). An earlier
-# guess of -221 deg was tried first and confirmed wrong (nowhere near the
-# observed range).
-GRIPPER_CALIBRATION_BIAS_DEG = 221.0
+# fully-closed position (gripper_displacement there is ~0mm).
+#
+# Re-measured 2026-08-26 after the gripper was physically reassembled.
+# Starting point was servo/spring_position_mode.py's newly re-measured
+# GRIPPER_CLOSED_DEG (-5.81, from a --measure-freeplay full-range test),
+# same as the raw closed-end reading -- but, same as the prior assembly's
+# calibration (221.0 vs. that assembly's GRIPPER_CLOSED_DEG of 216.9),
+# that needed a further fine-tune beyond the raw closed-end reading:
+# checking the live width readout (servo/check_gripper_width.py) against a
+# physical ruler at the middle of the gripper's range showed the raw
+# closed-end value alone (-5.81) read ~5mm too wide there. The curve's
+# local slope near mid-range is ~0.83 mm/deg (computed directly from
+# mapping_csv/mapping_function.csv), so a 5mm correction needed +6.05 deg
+# -- confirmed against the ruler at +6.05, giving this value. Re-check the
+# same way (check_gripper_width.py against a ruler at a few known
+# openings, not just fully-closed) if this ever drifts again.
+GRIPPER_CALIBRATION_BIAS_DEG = 0.24
 
 # Real measured maximum gripper opening (mm). The CSV's kinematic model
 # overshoots this near full-open (predicts up to ~85.4mm there) -- the
@@ -985,9 +995,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-calibration-offset-deg", type=float, default=GRIPPER_CALIBRATION_BIAS_DEG,
                          dest="gripper_calibration_offset_deg",
                          help=f"Deg added to every gear_displacement value in --gripper-calibration-csv so it "
-                              f"lines up with the servo's raw absolute reading. Default {GRIPPER_CALIBRATION_BIAS_DEG:.1f} "
-                              f"(measured 2026-08-19 for the current CSV/servo zero) -- re-measure and override "
-                              f"this if either changes.")
+                              f"lines up with the servo's raw absolute reading. Default {GRIPPER_CALIBRATION_BIAS_DEG:.2f} "
+                              f"(re-measured and ruler-verified 2026-08-26 after the gripper was physically "
+                              f"reassembled -- see the module-level comment on GRIPPER_CALIBRATION_BIAS_DEG) -- "
+                              f"re-measure and override this if either changes.")
     parser.add_argument("--gripper-max-width-mm", type=float, default=GRIPPER_MAX_WIDTH_MM,
                          dest="gripper_max_width_mm",
                          help=f"Real measured max gripper opening (mm) -- interpolated widths are capped at this "

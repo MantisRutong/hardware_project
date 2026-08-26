@@ -89,12 +89,20 @@ OPERATING_MODE_CURRENT_BASED_POSITION_CONTROL = 5
 
 # Measured mechanical range of motion of THIS gripper (horn angle at each end
 # of travel), from a hold-fully-open / hold-fully-closed test with
-# --measure-freeplay on 2026-08-17. These are absolute horn angles tied to
-# this specific horn-to-gear alignment -- if the horn is ever removed and
-# reinstalled (even one spline tooth off), or the gripper's own gearing is
-# changed, re-measure with --measure-freeplay and update these two numbers.
-GRIPPER_OPEN_DEG = 320.5
-GRIPPER_CLOSED_DEG = 216.9
+# --measure-freeplay. These are absolute horn angles tied to this specific
+# horn-to-gear alignment -- if the horn is ever removed and reinstalled
+# (even one spline tooth off), or the gripper's own gearing is changed,
+# re-measure with --measure-freeplay and update these two numbers.
+#
+# Re-measured 2026-08-26 after the gripper was physically reassembled --
+# the horn-to-gear alignment shifted by roughly -222 deg from the prior
+# 2026-08-17 measurement (216.9/320.5), consistent with the horn being
+# reattached at a different spline tooth, not a change in the mechanism's
+# actual range of motion (new range 109.74 deg vs old 103.6 deg -- close,
+# the small difference is plausibly just how precisely the end stops were
+# held during each test, not a real mechanical change).
+GRIPPER_OPEN_DEG = 103.93
+GRIPPER_CLOSED_DEG = -5.81
 GRIPPER_RANGE_MARGIN_DEG = 0.5  # default safety margin kept away from each end
 
 POSITION_UNIT_DEG = 0.088          # deg per position tick (4096 ticks/rev)
@@ -552,7 +560,7 @@ def main() -> int:
     parser.add_argument("--gripper-open-deg", type=float, default=GRIPPER_OPEN_DEG, dest="gripper_open_deg",
                          help=f"Horn angle (deg) at the gripper's fully-open end stop, from a "
                               f"--measure-freeplay hold-open/hold-closed calibration. Default is the value "
-                              f"measured for this assembly on 2026-08-17 ({GRIPPER_OPEN_DEG:.1f} deg) -- pass "
+                              f"measured for this assembly on 2026-08-26 ({GRIPPER_OPEN_DEG:.1f} deg) -- pass "
                               f"this flag instead of editing the source if you re-measure.")
     parser.add_argument("--gripper-closed-deg", type=float, default=GRIPPER_CLOSED_DEG, dest="gripper_closed_deg",
                          help=f"Horn angle (deg) at the gripper's fully-closed end stop. Default "
