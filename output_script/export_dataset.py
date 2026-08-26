@@ -15,11 +15,29 @@ deliberately vendored into this folder rather than referenced from
 
 Output Zarr layout (Zarr format 2, a plain directory store):
   data/
-    robot0_eef_pos            (N, 3)    f32  -- ORB-SLAM3 tracked position, meters
-    robot0_eef_rot_axis_angle (N, 3)    f32  -- orientation, axis-angle (rotation vector)
+    robot0_eef_pos             (N, 3)    f32  -- ABSOLUTE position, meters, per-episode origin (safe
+                                                  despite live resets: every episode is already one
+                                                  map_epoch segment, see WHY SPLIT below -- no episode
+                                                  ever spans a reset). Present so this dataset is
+                                                  directly loadable by the stock UMI dataset code,
+                                                  which expects this exact key, absolute.
+    robot0_eef_rot_axis_angle  (N, 3)    f32  -- ABSOLUTE orientation, axis-angle, same per-episode-
+                                                  origin safety as robot0_eef_pos above
+    robot0_eef_pos_delta       (N, 3)    f32  -- position CHANGE from the previous row, meters,
+                                                  WORLD frame (same frame demo_start_pose/
+                                                  demo_end_pose are in); row 0 of every episode
+                                                  is (0,0,0) -- no previous row to diff against
+    robot0_eef_rot_axis_angle_delta
+                                (N, 3)    f32  -- orientation CHANGE from the previous row, as a
+                                                  rotation vector, BODY frame (rot_prev^-1 * rot_curr,
+                                                  not rot_curr * rot_prev^-1 -- see ROTATION
+                                                  REPRESENTATION); row 0 of every episode is (0,0,0)
     robot0_gripper_width      (N, 1)    f32  -- meters (converted from gripper_width_mm)
-    robot0_demo_start_pose    (N, 6)    f32  -- (pos3, rotvec3) of this segment's FIRST frame, repeated every row
-    robot0_demo_end_pose      (N, 6)    f32  -- (pos3, rotvec3) of this segment's LAST frame, repeated every row
+    robot0_demo_start_pose    (N, 6)    f32  -- (pos3, rotvec3) of this segment's FIRST frame (ABSOLUTE,
+                                                  not delta -- an anchor, see POSITION REPRESENTATION),
+                                                  repeated every row
+    robot0_demo_end_pose      (N, 6)    f32  -- (pos3, rotvec3) of this segment's LAST frame (ABSOLUTE),
+                                                  repeated every row
     camera0_rgb                (N, H, W, 3) u1  -- RGB, native recording resolution
   meta/
     episode_ends               (num_episodes,) i8  -- cumulative row count at the end of each episode
@@ -39,6 +57,25 @@ would teach the policy an invisible teleport across the reset boundary.
 Splitting at every map_epoch change is the fix discussed and settled on
 earlier in this project's development.
 
+Switching position/rotation to delta encoding (see below) does NOT remove
+the need for this split -- it changes the shape of the failure if you
+DON'T split, but doesn't eliminate it. Without splitting, the single
+frame-to-frame delta computed ACROSS a reset boundary would still be
+fabricated: there is no real geometric relationship between the last
+pre-reset pose and the first post-reset one, so nothing correct can be
+written there -- not zero (that falsely claims no motion happened across
+that instant), not the raw difference (physically meaningless, since the
+two poses live in unrelated coordinate frames). Diffusion policy trains on
+WINDOWS of consecutive frames, not single steps, so one fabricated frame
+sitting inside an otherwise-real window risks corrupting every training
+sample that happens to include it -- a smaller blast radius than the old
+"entire trailing sub-trajectory is wrong" absolute-position failure, but
+still a real, avoidable one. Splitting into separate replay-buffer episodes
+(exactly what episode_ends exists to support -- the standard mechanism
+sequence-model dataset loaders use to guarantee no sampled window spans two
+different demonstrations) avoids this cleanly: no window can span a reset
+because none can span an episode boundary. So the split stays, unconditionally.
+
 WHY ONE ROW PER TRACKED POSE, NOT ONE PER CAMERA FRAME:
 camera_trajectory.csv only has a pose for frames ORB-SLAM3 actually
 attempted (throttled to 10Hz -- see OrbSlamWorker in synced_capture.py),
@@ -51,13 +88,50 @@ the exported dataset at roughly a 10Hz control rate, which is in the same
 ballpark as UMI's own reported training/control frequency, not a
 compromise made purely for this project's convenience.
 
-ACTION REPRESENTATION: this script stores ABSOLUTE per-frame pose plus
-each segment's start/end reference pose, mirroring the upstream layout
-exactly -- it does NOT bake in a specific delta/relative action encoding.
-That conversion (e.g. pose relative to a sliding reference frame) is a
-training-time dataset-loading concern in the upstream pipeline, not a
-storage concern, and this script follows that precedent rather than
-guessing at a specific scheme here.
+POSITION AND ROTATION REPRESENTATION: BOTH absolute pose
+(robot0_eef_pos, robot0_eef_rot_axis_angle -- matching upstream's own
+replay-buffer convention exactly, see 07_generate_replay_buffer.py) AND
+frame-to-frame CHANGE (robot0_eef_pos_delta, robot0_eef_rot_axis_angle_delta
+-- an explicit project requirement) are stored side by side. This was
+originally delta-only, which technically worked but meant the stock UMI
+dataset loader (which reads robot0_eef_pos/robot0_eef_rot_axis_angle by
+name, absolute) couldn't load this data without a custom loader being
+written. Storing both costs almost nothing (lowdim arrays are tiny next to
+the image data) and removes that requirement -- this data now loads
+directly under the existing pipeline's expected schema, while also
+carrying the delta fields for anything that wants them directly instead of
+computing them from the absolute fields.
+
+Storing absolute pose per-episode is safe DESPITE ORB-SLAM3's live resets
+specifically because of the map_epoch split below: every episode here is
+already one contiguous segment between resets, so "absolute" always means
+"absolute within this one episode's single consistent coordinate frame" --
+never spanning a reset, same guarantee demo_start_pose/demo_end_pose
+(themselves absolute, and always have been) already relied on. This isn't
+a new exception to the reset problem -- it's the same fix (the split)
+applied to two more fields.
+
+demo_start_pose/demo_end_pose remain useful even with robot0_eef_pos
+present directly: they're explicit anchors that don't require scanning to
+row 0/-1 of an episode to find the boundary values, and (together with the
+delta fields) let the full absolute trajectory be reconstructed even if
+robot0_eef_pos/robot0_eef_rot_axis_angle were ever dropped from a
+downstream copy of this data -- position via demo_start_pose[:3] +
+cumsum(robot0_eef_pos_delta), rotation by sequentially composing (not
+summing -- rotation isn't a vector space) robot0_eef_rot_axis_angle_delta
+onto demo_start_pose[3:].
+
+ROTATION REPRESENTATION DETAIL: robot0_eef_rot_axis_angle_delta uses the
+BODY frame (rot_prev^-1 * rot_curr), not world frame (rot_curr *
+rot_prev^-1) -- matching this project's own reference precedent
+(~/projects/diffusion_policy's tool_imu_pose.zarr documents its action as
+"drotation_vector_body"). Body-frame deltas describe how much the gripper
+rotated about ITS OWN axes, independent of which way it happened to be
+facing in the world at that instant -- the physically natural quantity for
+an action a policy would actually issue, and consistent with position
+delta being stored in world frame (position and rotation deltas are not
+expected to share a frame convention here; each uses whichever convention
+is standard for that quantity).
 
 Usage:
     export_dataset.py recording/scan_0001 recording/scan_0002 --output data/replay_buffer.zarr
@@ -157,9 +231,11 @@ def process_episode(
 ) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]]]:
     """Returns (segments, reports) -- segments is a list of per-episode row
     lists (each inner list is one replay-buffer episode: a surviving
-    map_epoch segment, with per-frame dicts eef_pos, eef_rot_axis_angle,
-    gripper_width_m, demo_start_pose, demo_end_pose, image_path), kept as
-    separate lists rather than flattened so the caller can derive
+    map_epoch segment, with per-frame dicts eef_pos, eef_rot_axis_angle
+    (both absolute), eef_pos_delta, eef_rot_axis_angle_delta, gripper_width_m,
+    demo_start_pose, demo_end_pose, image_path -- plus a transient eef_rot
+    Rotation object, used only internally for exact delta composition, not
+    exported), kept as separate lists rather than flattened so the caller can derive
     episode_ends directly from list boundaries instead of re-deriving them
     heuristically afterward -- an earlier version of this function
     flattened everything and had the caller detect boundaries by comparing
@@ -212,6 +288,7 @@ def process_episode(
 
             seg_rows.append({
                 "eef_pos": pos.astype(np.float32),
+                "eef_rot": Rotation.from_quat(quat_xyzw),  # kept as a Rotation, not rotvec, for exact composition below
                 "eef_rot_axis_angle": rotvec.astype(np.float32),
                 "gripper_width_m": np.float32(gripper_width_m),
                 "image_path": image_path,
@@ -225,8 +302,46 @@ def process_episode(
             })
             continue
 
+        # demo_start_pose/demo_end_pose stay ABSOLUTE (anchors) -- computed
+        # from eef_pos BEFORE it's overwritten with deltas below. See
+        # POSITION REPRESENTATION in the module docstring.
         start_pose = np.concatenate([seg_rows[0]["eef_pos"], seg_rows[0]["eef_rot_axis_angle"]]).astype(np.float32)
         end_pose = np.concatenate([seg_rows[-1]["eef_pos"], seg_rows[-1]["eef_rot_axis_angle"]]).astype(np.float32)
+
+        # Position/rotation CHANGE from the previous surviving row (not the
+        # previous row of the raw segment -- a frame can be dropped above
+        # for a too-large RGB offset or a missing image, and the delta
+        # should reflect the actual exported sequence, the only one a
+        # consumer of this dataset will ever see). Row 0 of the episode has
+        # no previous row to diff against -- zero, matching this project's
+        # earlier precedent for "no reference yet" (e.g. is_lost placeholder
+        # rows). This is also exactly why episodes are split at map_epoch
+        # boundaries rather than just at recording boundaries: a delta
+        # computed ACROSS a reset would be fabricated (the post-reset pose
+        # has no real geometric relationship to the pre-reset one), and
+        # unlike row 0's honest "no data yet" zero, a fabricated mid-episode
+        # zero would falsely claim the gripper didn't move/rotate across
+        # that instant -- see the module docstring's WHY SPLIT section.
+        #
+        # Rotation delta uses the BODY-frame convention (rot_prev^-1 * rot_curr),
+        # matching this project's own reference precedent
+        # (~/projects/diffusion_policy's tool_imu_pose.zarr documents its
+        # action as "drotation_vector_body") -- NOT world-frame, which would
+        # instead be rot_curr * rot_prev^-1. Composed via Rotation objects,
+        # not by subtracting rotation vectors (rotation isn't a vector space;
+        # subtracting axis-angle representations directly is only a valid
+        # approximation for small angles between consecutive frames, not an
+        # exact delta in general).
+        prev_pos = seg_rows[0]["eef_pos"]
+        prev_rot = seg_rows[0]["eef_rot"]
+        seg_rows[0]["eef_pos_delta"] = np.zeros(3, dtype=np.float32)
+        seg_rows[0]["eef_rot_axis_angle_delta"] = np.zeros(3, dtype=np.float32)
+        for r in seg_rows[1:]:
+            r["eef_pos_delta"] = (r["eef_pos"] - prev_pos).astype(np.float32)
+            r["eef_rot_axis_angle_delta"] = (prev_rot.inv() * r["eef_rot"]).as_rotvec().astype(np.float32)
+            prev_pos = r["eef_pos"]
+            prev_rot = r["eef_rot"]
+
         for r in seg_rows:
             r["demo_start_pose"] = start_pose
             r["demo_end_pose"] = end_pose
@@ -291,10 +406,23 @@ def main() -> None:
     lowdim_compressor = numcodecs.Blosc(cname="zstd", clevel=5, shuffle=numcodecs.Blosc.SHUFFLE)
     img_compressor = numcodecs.Blosc(cname="zstd", clevel=5, shuffle=numcodecs.Blosc.SHUFFLE)
 
+    # Absolute pose, alongside the delta fields below -- safe to store
+    # despite ORB-SLAM3's live resets specifically BECAUSE every episode
+    # here is already one map_epoch segment (see WHY SPLIT in the module
+    # docstring): no episode ever spans a reset, so "absolute" here always
+    # means "absolute within this episode's one consistent coordinate
+    # frame", exactly like demo_start_pose/demo_end_pose already are. This
+    # is what makes the stock UMI dataset loader (which expects these two
+    # keys, absolute, un-split scan_XXXX recordings notwithstanding) able
+    # to read this data directly instead of needing a custom loader.
     eef_pos = data.create_dataset("robot0_eef_pos", shape=(n, 3), chunks=(min(1000, n), 3),
                                    dtype="f4", compressor=lowdim_compressor)
     eef_rot = data.create_dataset("robot0_eef_rot_axis_angle", shape=(n, 3), chunks=(min(1000, n), 3),
                                    dtype="f4", compressor=lowdim_compressor)
+    eef_pos_delta = data.create_dataset("robot0_eef_pos_delta", shape=(n, 3), chunks=(min(1000, n), 3),
+                                         dtype="f4", compressor=lowdim_compressor)
+    eef_rot_delta = data.create_dataset("robot0_eef_rot_axis_angle_delta", shape=(n, 3), chunks=(min(1000, n), 3),
+                                         dtype="f4", compressor=lowdim_compressor)
     gripper_width = data.create_dataset("robot0_gripper_width", shape=(n, 1), chunks=(min(1000, n), 1),
                                          dtype="f4", compressor=lowdim_compressor)
     demo_start = data.create_dataset("robot0_demo_start_pose", shape=(n, 6), chunks=(min(1000, n), 6),
@@ -307,6 +435,8 @@ def main() -> None:
     for i, row in enumerate(all_rows):
         eef_pos[i] = row["eef_pos"]
         eef_rot[i] = row["eef_rot_axis_angle"]
+        eef_pos_delta[i] = row["eef_pos_delta"]
+        eef_rot_delta[i] = row["eef_rot_axis_angle_delta"]
         gripper_width[i] = row["gripper_width_m"]
         demo_start[i] = row["demo_start_pose"]
         demo_end[i] = row["demo_end_pose"]
@@ -325,11 +455,22 @@ def main() -> None:
     meta.array("episode_ends", np.asarray(episode_ends, dtype=np.int64),
                chunks=(max(len(episode_ends), 1),), compressor=None)
     root.attrs.update({
-        "pose_representation": "position_plus_axis_angle",
+        "pose_representation": "absolute_plus_delta_world_pos_body_rot",
         "gripper_width_units": "meters",
-        "action_note": "Absolute per-frame pose + per-episode demo_start_pose/demo_end_pose are stored; "
-                        "relative/delta action encoding, if needed for training, is left to the dataset "
-                        "loader (matches upstream UMI's own convention -- see this script's module docstring).",
+        "action_note": "robot0_eef_pos/robot0_eef_rot_axis_angle are ABSOLUTE, per-episode-origin (matches "
+                        "upstream UMI's own replay-buffer convention exactly -- this data loads directly "
+                        "under the stock dataset code's expected schema). robot0_eef_pos_delta is "
+                        "frame-to-frame position CHANGE in WORLD frame; robot0_eef_rot_axis_angle_delta is "
+                        "frame-to-frame rotation CHANGE in BODY frame (rot_prev^-1 * rot_curr) -- an "
+                        "additional project-specific requirement stored alongside the absolute fields, not "
+                        "instead of them. Row 0 of each episode is (0,0,0) for both delta fields -- no "
+                        "previous row to diff against. demo_start_pose/demo_end_pose are ABSOLUTE per-episode "
+                        "anchors, redundant with row 0/-1 of robot0_eef_pos/robot0_eef_rot_axis_angle but "
+                        "kept as explicit, easy-to-find anchors. See this script's module docstring "
+                        "(POSITION AND ROTATION REPRESENTATION) for the full reasoning, including why "
+                        "storing absolute pose per-episode is safe despite ORB-SLAM3's live resets (every "
+                        "episode is already one contiguous map_epoch segment -- see WHY SPLIT -- so "
+                        "'absolute' never spans a reset).",
         "episode_note": "One replay-buffer episode = one contiguous ORB-SLAM3 map_epoch segment, NOT one "
                          "recorded scan_XXXX folder -- a single recording can span multiple episodes here "
                          "if ORB-SLAM3 reset mid-recording.",
