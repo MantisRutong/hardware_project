@@ -86,6 +86,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import threading
 import time
@@ -106,6 +107,15 @@ from orbslam_bridge import (  # noqa: E402
     DEFAULT_SETTINGS_PATH as ORBSLAM_DEFAULT_SETTINGS_PATH,
     DEFAULT_VOCAB_PATH as ORBSLAM_DEFAULT_VOCAB_PATH,
     OrbSlamTracker,
+)
+
+# Settings variant with System.LoadAtlasFromFile set -- used instead of
+# ORBSLAM_DEFAULT_SETTINGS_PATH whenever --orbslam-map-dir is given, to
+# localize against a pre-built map (see output_script/build_atlas_map.py)
+# instead of cold-starting a fresh one each episode. See that YAML's own
+# comment for the full mechanism/why.
+ORBSLAM_DEFAULT_RELOCALIZE_SETTINGS_PATH = (
+    ORBSLAM_DEFAULT_SETTINGS_PATH.parent / "RealSense_D435i_ours_relocalize.yaml"
 )
 
 # Default OpenVINS estimator config for this rig's D435I -- see
@@ -1034,6 +1044,23 @@ def parse_args() -> argparse.Namespace:
                          help="Also launch ORB-SLAM3's own Pangolin 3D map viewer window (default: off -- "
                               "this script's own --monitor window already gives live feedback; the Pangolin "
                               "viewer is mainly for standalone debugging of tracking/map quality).")
+    parser.add_argument("--orbslam-map-dir", type=Path, default=None, dest="orbslam_map_dir",
+                         help="Directory containing a pre-built atlas.osa (see output_script/build_atlas_map.py) "
+                              "to LOCALIZE against instead of cold-starting a fresh map each episode -- avoids "
+                              "the 'not enough motion for initializing' reset loop that careful/precise "
+                              "manipulation can trigger from scratch (see ORB_SLAM3/config/"
+                              "RealSense_D435i_ours_relocalize.yaml's comment for the full mechanism). When set, "
+                              "--orbslam-settings is ignored in favor of RealSense_D435i_ours_relocalize.yaml "
+                              "(or --orbslam-relocalize-settings if given), and the process temporarily chdir()s "
+                              "into this directory while constructing each episode's OrbSlamTracker (ORB-SLAM3 "
+                              "hardcodes the load path as ./atlas.osa relative to the process's cwd at "
+                              "construction time -- not configurable). Default: None (cold-start each episode, "
+                              "today's original behavior).")
+    parser.add_argument("--orbslam-relocalize-settings", type=Path, default=ORBSLAM_DEFAULT_RELOCALIZE_SETTINGS_PATH,
+                         dest="orbslam_relocalize_settings",
+                         help=f"Settings YAML to use when --orbslam-map-dir is set (must have "
+                              f"System.LoadAtlasFromFile pointed at that dir's atlas). "
+                              f"Default: {ORBSLAM_DEFAULT_RELOCALIZE_SETTINGS_PATH}")
 
     # Live OpenVINS (monocular) tracking -- see openvins_bridge.py. Off by
     # default now (see module-level comment above DEFAULT_OPENVINS_CONFIG);
@@ -1071,6 +1098,37 @@ def parse_args() -> argparse.Namespace:
                               "(a plain Enter/Space only ends the current episode and moves on to the next).")
 
     return parser.parse_args()
+
+
+def construct_orb_tracker(args: argparse.Namespace) -> "OrbSlamTracker | None":
+    """Builds this episode's ORB-SLAM3 tracker -- either a fresh cold-start
+    map (default), or localizing against a pre-built atlas via
+    --orbslam-map-dir (see that flag's help and
+    ORB_SLAM3/config/RealSense_D435i_ours_relocalize.yaml's comment for the
+    mechanism/why).
+
+    Handles the required os.chdir() dance for the map-dir case: ORB-SLAM3
+    hardcodes the atlas load path as ./atlas.osa relative to the process's
+    cwd AT CONSTRUCTION TIME (not configurable -- see System::LoadAtlas in
+    ORB_SLAM3/src/System.cc), so this temporarily chdirs into
+    --orbslam-map-dir, constructs, then chdirs back before returning --
+    the caller's cwd is unchanged either way, including if construction
+    raises. Safe to call from the main per-episode setup block specifically
+    BECAUSE it runs synchronously there, before any other thread (camera
+    saving, servo polling) is doing its own relative-path file I/O that a
+    process-wide chdir could otherwise race with."""
+    if not args.orbslam:
+        return None
+    if args.orbslam_map_dir is None:
+        return OrbSlamTracker(args.orbslam_settings, args.orbslam_vocab, args.orbslam_lib,
+                               use_viewer=args.orbslam_viewer)
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(args.orbslam_map_dir)
+        return OrbSlamTracker(args.orbslam_relocalize_settings, args.orbslam_vocab, args.orbslam_lib,
+                               use_viewer=args.orbslam_viewer)
+    finally:
+        os.chdir(original_cwd)
 
 
 def main() -> int:
@@ -1288,12 +1346,7 @@ def main() -> int:
                 orb_worker.close()
             if orb_tracker is not None:
                 orb_tracker.close()
-            orb_tracker = (
-                OrbSlamTracker(args.orbslam_settings, args.orbslam_vocab, args.orbslam_lib,
-                                use_viewer=args.orbslam_viewer)
-                if args.orbslam
-                else None
-            )
+            orb_tracker = construct_orb_tracker(args)
             orb_trajectory: list[dict[str, Any]] = []
             orb_last_print = [0.0]  # mutable box, see _on_orb_pose
             orb_last_map_epoch: list[int | None] = [None]  # mutable box, see _on_orb_pose
@@ -1592,8 +1645,15 @@ def main() -> int:
                     "color_fps_requested": args.color_fps,
                     "orbslam": (
                         {
-                            "settings_path": str(args.orbslam_settings),
+                            "settings_path": str(
+                                args.orbslam_relocalize_settings if args.orbslam_map_dir is not None
+                                else args.orbslam_settings
+                            ),
                             "vocab_path": str(args.orbslam_vocab),
+                            # None when this episode cold-started a fresh map (today's
+                            # original behavior); set when it localized against a
+                            # pre-built one instead -- see --orbslam-map-dir.
+                            "map_dir": str(args.orbslam_map_dir) if args.orbslam_map_dir is not None else None,
                             "frames_tracked": sum(1 for r in orb_trajectory if r["is_lost"] == 0),
                             "frames_total": len(orb_trajectory),
                             "trajectory_path": "camera_trajectory.csv",
