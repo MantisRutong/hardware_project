@@ -207,3 +207,38 @@ Rearranging it means re-running `build_atlas_map.py`.
   dot pattern* smearing under handheld motion. With the emitter now off for tracking, that
   basis no longer holds -- real world-fixed texture has a different blur budget, so the
   value needs re-measuring rather than assuming it still applies.
+
+- **A grasped object becomes camera-fixed for as long as it's held, and nothing handles
+  that.** The static gripper mask cannot: where a held object lands in frame depends on
+  where and how it was grasped. Measured on existing recordings with a sliding 1.5s
+  temporal-mean sharpness test (the same camera-fixed detector used to derive the gripper
+  mask, minus the known gripper region), the signal is real and lines up with grasp
+  phases -- scan_0009 shows eight consecutive elevated windows from 12s, scan_0007 shows
+  19 of 26. During those windows the held object is ~2.3-2.8% of the frame but takes
+  **11-13% of the features that remain after gripper masking** (104 of 786 per frame in
+  scan_0009; 91 of 798 in scan_0007).
+
+  Probably survivable as-is: `Optimizer::PoseOptimization` uses a Huber robust kernel
+  (`thHuber2D = sqrt(5.99)`, `src/Optimizer.cc`) and four rounds of chi-squared outlier
+  rejection (`if(e->chi2() > 5.991) ... nBad++`), which is exactly the mechanism for a
+  minority of points whose motion disagrees with the rest. 11-13% is a clear minority.
+
+  Three reasons not to treat that as settled: (1) it's a minority *in these recordings* --
+  a closer grasp, a larger object, or a view pointed at the blankest part of the workspace
+  could multiply it, and this scene is texture-poor to begin with; (2) the object was
+  mapped in its pre-grasp position, so after it moves those map points are stale and can
+  mis-associate -- that pollutes the *map*, which outlives any single frame's pose, and it
+  is baked into `atlas.osa` if it happens during the mapping pass; (3) it happens
+  precisely during the careful, small-displacement phase that is already closest to the
+  IMU-init motion threshold.
+
+  Deliberately not fixed in code. A static mask can't cover it, and per-frame dynamic
+  rejection would be re-implementing what the robust kernel already does, with more ways
+  to get it wrong. The real lever is the denominator: strong world-fixed texture *around*
+  the manipulation region dilutes the object's share and gives outlier rejection a solid
+  inlier majority to work against -- which is the reason for putting added texture around
+  the workspace rather than in it. One cheap option held in reserve: extending the gripper
+  mask upward by 40-60px would cover much of where held objects sit (they appear directly
+  above the current boundary), at the cost of the manipulation region's own pixels -- which
+  are pixels SLAM wants nothing from anyway. Not done blind; decide it against live
+  `camera_trajectory.csv` behaviour during grasp phases once the scene texture is in place.
