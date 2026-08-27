@@ -60,6 +60,36 @@ IR_PROFILES = (
     (640, 480, 30),
 )
 
+# Max exposure (microseconds) allowed for the Stereo Module (the IR cameras
+# ORB-SLAM3 tracks against) before this project's auto-exposure-with-a-cap
+# logic (see _cap_stereo_exposure_if_needed) switches from auto-exposure to
+# a fixed, short exposure instead. Root cause this addresses: live testing
+# (2026-08-26, pick-and-place over a partly plain table) showed the Stereo
+# Module's auto-exposure settling around 8500us in that scene/lighting --
+# long enough that ordinary handheld reach/reposition motion visibly
+# streaked the IR emitter's projected dot pattern into short comma-shapes
+# instead of crisp points (confirmed by inspecting the saved ir_left PNGs
+# directly), destroying the only texture a plain surface had to offer and
+# driving ORB-SLAM3 into a near-constant reset loop (66-91 resets in a
+# single 15-25s episode, every tracked segment only ~3 frames long). Not
+# root-derived from a precise blur budget (that would need this specific
+# camera's FOV/resolution and real handheld angular velocity data neither
+# of which was rigorously measured) -- picked as a reasonable, empirically-
+# adjustable starting point (a fraction of the 8500us that was clearly too
+# long), to be validated against a live retest and tightened/loosened from
+# there if needed.
+#
+# STALE BASIS, needs revalidation: the above was measured while the IR
+# emitter was on and its projected dots were the only texture a plain table
+# offered. _set_emitter_for_depth() now switches the emitter OFF whenever
+# the IR streams are feeding ORB-SLAM3 (see that method for why), so the
+# thing this number was chosen to keep un-smeared isn't in the image
+# anymore. Real world-fixed texture -- surface detail, and deliberately
+# added stickers around the workspace -- has a different blur budget than a
+# projected dot pattern, so this value should be re-measured under the new
+# configuration rather than assumed to still be right.
+IR_EXPOSURE_CAP_US = 3000.0
+
 
 @dataclass(frozen=True)
 class VideoProfile:
@@ -253,6 +283,14 @@ class RealSenseCapture:
                 )
                 self.enable_imu = with_imu
                 self.record_ir = ir_profile is not None
+                # depth_profile is None exactly when depth isn't being
+                # recorded (see the attempt-building above, which skips the
+                # depth stream entirely in that case), so this is the real
+                # "is the depth stream running" signal, not just intent.
+                if self.record_ir or depth_profile is not None:
+                    self._set_emitter_for_depth(depth_profile is not None)
+                if self.record_ir:
+                    self._cap_stereo_exposure_if_needed()
                 return
             except Exception as exc:  # noqa: BLE001 - pyrealsense throws runtime errors
                 errors.append(
@@ -265,6 +303,131 @@ class RealSenseCapture:
 
         detail = "\n".join(errors[-6:])
         raise RuntimeError(f"Unable to start RealSense camera. Recent errors:\n{detail}")
+
+    def _set_emitter_for_depth(self, depth_enabled: bool) -> None:
+        """Turn the D435i's IR projector ON only when the depth stream is
+        actually running, and OFF otherwise.
+
+        The projector paints a dot pattern onto the scene so stereo depth
+        has something to match on otherwise-featureless surfaces -- it is
+        genuinely needed for usable depth on e.g. a plain table. But the
+        pattern is projected FROM the camera, so it is camera-fixed, not
+        world-fixed: as the camera moves, every dot slides across whatever
+        surface it lands on. That makes the dots actively harmful as ORB
+        features, which is what the IR streams are used for here
+        (Stereo-Inertial tracking): a dot is not a static landmark, so
+        matching one across frames reports camera/world motion that never
+        happened. The dots are also near-identical to each other, so their
+        descriptors are ambiguous and mismatch easily. ORB-SLAM3's own
+        RealSense examples draw exactly this line -- the Stereo,
+        Stereo-Inertial, Monocular and Calibration examples all switch the
+        emitter off, while only the RGB-D ones (which consume the depth
+        map, not IR features) leave it on.
+
+        Keyed off the depth stream rather than exposed as its own CLI flag:
+        there's no configuration that wants a third answer, and one less
+        knob is one less thing to get wrong. Set explicitly on every start
+        rather than only when changing it, because this option persists on
+        the device across process restarts -- a session that inherited
+        whatever the previous run left behind would otherwise silently get
+        the wrong one.
+
+        Called BEFORE _cap_stereo_exposure_if_needed(): the projector adds
+        light to the scene, so auto-exposure has to be sampled with the
+        emitter already in its final state, or the measurement describes a
+        scene that won't exist during the actual recording.
+        """
+        if self.profile is None:
+            return
+        try:
+            device = self.profile.get_device()
+            stereo_sensor = next(
+                (s for s in device.query_sensors() if "Stereo" in s.get_info(self.rs.camera_info.name)), None
+            )
+            if stereo_sensor is None or not stereo_sensor.supports(self.rs.option.emitter_enabled):
+                return
+            stereo_sensor.set_option(self.rs.option.emitter_enabled, 1 if depth_enabled else 0)
+            if depth_enabled:
+                print("[camera] IR emitter ON (depth stream is running and needs the projected pattern). "
+                      "Note this pattern is camera-fixed, so it degrades IR-based ORB-SLAM3 tracking.")
+            else:
+                print("[camera] IR emitter OFF -- the IR streams feed ORB-SLAM3, and the projected dot "
+                      "pattern moves with the camera rather than staying fixed in the world.")
+        except Exception as exc:  # noqa: BLE001 -- never worth failing capture over
+            print(f"[camera] WARNING: could not set the IR emitter ({exc}) -- continuing with whatever "
+                  f"state the device was left in, which may not match this session's needs.")
+
+    def _cap_stereo_exposure_if_needed(self) -> None:
+        """Sample what auto-exposure picks for the Stereo Module (the IR
+        cameras ORB-SLAM3 tracks against) right after the pipeline starts.
+        If it's long enough to risk motion-blurring away the scene's
+        texture during ordinary handheld motion, switch to a fixed,
+        shorter exposure instead -- if the scene/lighting is already bright
+        enough that auto-exposure settles on something short, leave
+        auto-exposure running as-is. See IR_EXPOSURE_CAP_US for the
+        threshold and the root cause this addresses.
+
+        Checked ONCE, right after this pipeline start -- not continuously
+        re-evaluated during the recording. A mid-recording mode flip (auto
+        -> fixed or back) would itself be a discontinuity in the image
+        stream, and lighting conditions aren't expected to change meaningfully
+        within one episode -- if they do turn out to (e.g. moving between
+        rooms mid-session), re-running with fresh conditions picks a fresh
+        value naturally, since this runs again on every start_camera() call.
+        """
+        if self.profile is None:
+            return
+        try:
+            device = self.profile.get_device()
+            stereo_sensor = next(
+                (s for s in device.query_sensors() if "Stereo" in s.get_info(self.rs.camera_info.name)), None
+            )
+            if stereo_sensor is None or not stereo_sensor.supports(self.rs.option.exposure):
+                return
+            # Force auto-exposure ON first, even if a PRIOR session already
+            # capped it: the exposure/auto-exposure options persist on the
+            # device across process restarts, so without this, a session
+            # that inherits an already-capped sensor would just see
+            # "current (3000) <= cap (3000)" and never re-test whether
+            # conditions (e.g. better lighting since then) would now let
+            # auto-exposure pick something blur-safe on its own -- it'd
+            # stay capped forever instead of this being re-decided fresh
+            # every session, which is the actual intent (see docstring).
+            if not stereo_sensor.get_option(self.rs.option.enable_auto_exposure):
+                stereo_sensor.set_option(self.rs.option.enable_auto_exposure, 1)
+            # Let auto-exposure settle before sampling -- right after
+            # enabling it, the first reading can still reflect the
+            # previous fixed value or the sensor's power-on default, not a
+            # real measurement of this scene.
+            time.sleep(0.5)
+            current_exposure_us = stereo_sensor.get_option(self.rs.option.exposure)
+            if current_exposure_us <= IR_EXPOSURE_CAP_US:
+                print(f"[camera] Stereo Module auto-exposure at {current_exposure_us:.0f}us -- "
+                      f"within the blur-safe range ({IR_EXPOSURE_CAP_US:.0f}us), leaving auto-exposure on.")
+                return
+
+            # Compensate for the shorter exposure by scaling gain up by
+            # roughly the same factor exposure is being cut by, so the
+            # image doesn't come out badly underexposed -- an
+            # approximation (assumes roughly linear gain response), not a
+            # metered calculation, clamped to the sensor's real supported
+            # range either way.
+            current_gain = (
+                stereo_sensor.get_option(self.rs.option.gain) if stereo_sensor.supports(self.rs.option.gain) else None
+            )
+            stereo_sensor.set_option(self.rs.option.enable_auto_exposure, 0)
+            stereo_sensor.set_option(self.rs.option.exposure, IR_EXPOSURE_CAP_US)
+            if current_gain is not None:
+                gain_range = stereo_sensor.get_option_range(self.rs.option.gain)
+                target_gain = current_gain * (current_exposure_us / IR_EXPOSURE_CAP_US)
+                new_gain = max(gain_range.min, min(gain_range.max, target_gain))
+                stereo_sensor.set_option(self.rs.option.gain, new_gain)
+            print(f"[camera] Stereo Module auto-exposure picked {current_exposure_us:.0f}us (too long, risks "
+                  f"motion blur) -- capped to a fixed {IR_EXPOSURE_CAP_US:.0f}us"
+                  + (f", gain compensated {current_gain:.1f}->{new_gain:.1f}" if current_gain is not None else "") + ".")
+        except Exception as exc:  # noqa: BLE001 -- exposure tuning is a best-effort improvement, never worth failing capture over
+            print(f"[camera] WARNING: could not check/cap Stereo Module exposure ({exc}) -- continuing with "
+                  f"whatever auto-exposure picks.")
 
     def stop_camera(self) -> None:
         self.active.clear()
