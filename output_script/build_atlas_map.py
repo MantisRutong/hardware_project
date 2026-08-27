@@ -101,6 +101,7 @@ from orbslam_bridge import DEFAULT_LIB_PATH, DEFAULT_VOCAB_PATH, OrbSlamTracker 
 # debugging to get right (see that class's own docstring); duplicating it
 # here instead of importing would risk silently regressing the same bug.
 from synced_capture import OrbSlamWorker  # noqa: E402
+from gripper_mask import load_stereo_masks  # noqa: E402
 
 DEFAULT_MAPPING_SETTINGS = Path("/home/hakan/Desktop/umi/ORB_SLAM3/config/RealSense_D435i_ours_mapping.yaml")
 
@@ -118,6 +119,11 @@ def main() -> int:
                               "data collection, there's no servo/recording load competing for it, and seeing "
                               "map coverage live is the actual point of this script).")
     parser.add_argument("--no-viewer", dest="viewer", action="store_false")
+    parser.add_argument("--gripper-mask", dest="gripper_mask", action=argparse.BooleanOptionalAction,
+                         default=True,
+                         help="Blank the wrist-mounted gripper out of the frames before ORB-SLAM3 sees them "
+                              "(default: on). Especially important here -- see the comment at the mask's "
+                              "construction below, and camera/gripper_mask.py.")
     parser.add_argument("--max-duration", type=float, default=None, help="Optional safety cap, seconds.")
     parser.add_argument("--min-interval", type=float, default=0.1,
                          help="OrbSlamWorker submission throttle, seconds (default 0.1s/10Hz -- see "
@@ -180,7 +186,23 @@ def main() -> int:
                 print(f"\r[mapping] tracked {tracked_count[0]}/{total_count[0]}  (lost)  "
                       f"map_epoch={map_epoch}   ", end="", flush=True)
 
-    worker = OrbSlamWorker(tracker, _on_pose, min_interval=args.min_interval)
+    # Masking matters MORE here than during a demo: whatever ORB-SLAM3 sees
+    # while mapping gets triangulated into map points and written into
+    # atlas.osa. Gripper features would land in there at whatever world
+    # position the camera happened to occupy, and every later relocalization
+    # would then have the gripper -- always in the same image location --
+    # able to match them. See camera/gripper_mask.py.
+    gripper_masks = None
+    if args.gripper_mask:
+        try:
+            gripper_masks = load_stereo_masks()
+            print(f"[mapping] gripper mask on -- blanking "
+                  f"{100 * gripper_masks[0].coverage((480, 848)):.1f}% of each IR frame before tracking.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[mapping] WARNING: could not load the gripper mask ({exc}) -- the atlas will contain "
+                  f"map points from camera-fixed gripper features.")
+
+    worker = OrbSlamWorker(tracker, _on_pose, min_interval=args.min_interval, gripper_masks=gripper_masks)
 
     def _on_imu_sample(kind: str, row: dict[str, Any]) -> None:
         if kind == "gyro":
