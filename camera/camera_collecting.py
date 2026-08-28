@@ -123,6 +123,7 @@ class RealSenseCapture:
         show_preview: bool,
         preview_fps: float,
         record_ir: bool = False,
+        save_to_disk: bool = True,
         requested_ir: "VideoProfile | None" = None,
         on_frame: Callable[[int, int, Any], None] | None = None,
         on_preview_frame: Callable[[Any], None] | None = None,
@@ -177,6 +178,14 @@ class RealSenseCapture:
         self.record_rgb = record_rgb
         self.record_depth = record_depth
         self.record_ir = record_ir
+        # Live consumers (teleoperation) need the streams and the
+        # on_stereo_frame/on_imu_sample hooks, but must NOT leave a
+        # recording behind: record_ir gates both the stream and saving, so
+        # without this a control session silently writes thousands of PNGs
+        # wherever it was launched from. Only affects writing -- callbacks,
+        # counters and frame_rows are untouched, so anything reading live
+        # state behaves identically.
+        self.save_to_disk = save_to_disk
         self.queue_size = queue_size
         self.imu_fps = imu_fps
         self.show_preview = show_preview
@@ -504,15 +513,19 @@ class RealSenseCapture:
         imu_dir = self.scan_dir / "imu"
         ir_left_dir = self.scan_dir / "ir_left"
         ir_right_dir = self.scan_dir / "ir_right"
-        if self.record_rgb:
-            rgb_dir.mkdir(parents=True, exist_ok=True)
-        if self.record_depth:
-            depth_dir.mkdir(parents=True, exist_ok=True)
-        if self.enable_imu:
-            imu_dir.mkdir(parents=True, exist_ok=True)
-        if self.record_ir:
-            ir_left_dir.mkdir(parents=True, exist_ok=True)
-            ir_right_dir.mkdir(parents=True, exist_ok=True)
+        # Nothing is written when save_to_disk is off, so creating the
+        # directories would only leave empty ones behind wherever a live
+        # session happened to be launched from.
+        if self.save_to_disk:
+            if self.record_rgb:
+                rgb_dir.mkdir(parents=True, exist_ok=True)
+            if self.record_depth:
+                depth_dir.mkdir(parents=True, exist_ok=True)
+            if self.enable_imu:
+                imu_dir.mkdir(parents=True, exist_ok=True)
+            if self.record_ir:
+                ir_left_dir.mkdir(parents=True, exist_ok=True)
+                ir_right_dir.mkdir(parents=True, exist_ok=True)
 
         self.start_mono_ns = time.monotonic_ns()
         self.end_mono_ns = (
@@ -846,17 +859,20 @@ class RealSenseCapture:
 
         if self.record_rgb:
             color = np.asanyarray(color_frame.get_data())
-            Image.fromarray(color, mode="RGB").save(rgb_dir / rgb_name, compress_level=1)
+            if self.save_to_disk:
+                Image.fromarray(color, mode="RGB").save(rgb_dir / rgb_name, compress_level=1)
         if self.record_depth and depth_frame is not None:
             depth = np.asanyarray(depth_frame.get_data())
-            Image.fromarray(depth).save(depth_dir / depth_name, compress_level=1)
+            if self.save_to_disk:
+                Image.fromarray(depth).save(depth_dir / depth_name, compress_level=1)
         left_gray: np.ndarray | None = None
         right_gray: np.ndarray | None = None
         if ir_left_frame is not None:
             left_gray = np.asanyarray(ir_left_frame.get_data())
             right_gray = np.asanyarray(ir_right_frame.get_data())
-            Image.fromarray(left_gray, mode="L").save(ir_left_dir / ir_name, compress_level=1)
-            Image.fromarray(right_gray, mode="L").save(ir_right_dir / ir_name, compress_level=1)
+            if self.save_to_disk:
+                Image.fromarray(left_gray, mode="L").save(ir_left_dir / ir_name, compress_level=1)
+                Image.fromarray(right_gray, mode="L").save(ir_right_dir / ir_name, compress_level=1)
 
         frame_rows.append(
             {
@@ -888,6 +904,8 @@ class RealSenseCapture:
             self._call_hook(self.on_stereo_frame, frame_id, host_time_ns, left_gray, right_gray)
 
     def _write_frame_indexes(self, frame_rows: list[dict[str, Any]]) -> None:
+        if not self.save_to_disk:
+            return
         with (self.scan_dir / "frames.csv").open("w", newline="") as f:
             fieldnames = [
                 "frame_id",
@@ -943,6 +961,8 @@ class RealSenseCapture:
                     f_right.write(f"{row['color_timestamp_seconds']:.9f} {row['ir_right_path']}\n")
 
     def _write_imu_csvs(self, imu_dir: Path) -> None:
+        if not self.save_to_disk:
+            return
         # Written at the IMU's own native sample rate (e.g. ~200Hz), NOT reduced
         # to one row per camera frame -- these are raw motion-frame samples as
         # they arrived, so there is no frame_id/frame_timestamp_seconds to

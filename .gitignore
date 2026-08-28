@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Teleoperation runtime artefacts
+umi_teleop_orbslam.log
+teleop_frame.json
+
+# LibreOffice lock files
+.~lock.*#
