@@ -86,6 +86,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import threading
 import time
@@ -99,6 +100,7 @@ sys.path.insert(0, str(REPO_ROOT / "camera"))
 sys.path.insert(0, str(REPO_ROOT / "servo"))
 
 import camera_collecting as cam  # noqa: E402
+from gripper_mask import load_stereo_masks  # noqa: E402
 import spring_position_mode as servo_mod  # noqa: E402
 from openvins_bridge import DEFAULT_LIB_PATH as OPENVINS_DEFAULT_LIB_PATH, OpenVinsTracker  # noqa: E402
 from orbslam_bridge import (  # noqa: E402
@@ -106,6 +108,15 @@ from orbslam_bridge import (  # noqa: E402
     DEFAULT_SETTINGS_PATH as ORBSLAM_DEFAULT_SETTINGS_PATH,
     DEFAULT_VOCAB_PATH as ORBSLAM_DEFAULT_VOCAB_PATH,
     OrbSlamTracker,
+)
+
+# Settings variant with System.LoadAtlasFromFile set -- used instead of
+# ORBSLAM_DEFAULT_SETTINGS_PATH whenever --orbslam-map-dir is given, to
+# localize against a pre-built map (see output_script/build_atlas_map.py)
+# instead of cold-starting a fresh one each episode. See that YAML's own
+# comment for the full mechanism/why.
+ORBSLAM_DEFAULT_RELOCALIZE_SETTINGS_PATH = (
+    ORBSLAM_DEFAULT_SETTINGS_PATH.parent / "RealSense_D435i_ours_relocalize.yaml"
 )
 
 # Default OpenVINS estimator config for this rig's D435I -- see
@@ -317,9 +328,18 @@ class OrbSlamWorker:
     something several seconds in the past.
     """
 
-    def __init__(self, tracker: "OrbSlamTracker", on_pose, min_interval: float = 0.1):
+    def __init__(self, tracker: "OrbSlamTracker", on_pose, min_interval: float = 0.1,
+                 gripper_masks: "tuple[Any, Any] | None" = None):
         self.tracker = tracker
         self.on_pose = on_pose  # callback(timestamp, pose_tuple_or_None, map_epoch)
+        # (left, right) GripperMask, or None to feed frames through untouched.
+        # Applied on THIS worker's thread rather than in the submit hook --
+        # see _run(). The wrist-mounted gripper is permanently in frame and
+        # its features are camera-fixed, which is worse than useless for
+        # tracking and poisons a saved atlas; see camera/gripper_mask.py's
+        # module docstring for the full reasoning and for what the feathered
+        # boundary does and doesn't fix.
+        self.gripper_masks = gripper_masks
         # Caps how often this worker will even ATTEMPT a track_stereo() call
         # (default 10Hz) -- see the class docstring's "learned the hard way"
         # note. This is distinct from "drop if busy": that alone still lets
@@ -388,6 +408,16 @@ class OrbSlamWorker:
                 time.sleep(0.005)
                 continue
             timestamp, left_gray, right_gray = item
+            if self.gripper_masks is not None:
+                # Masked HERE, not in submit(): submit() runs on
+                # RealSenseCapture's capture-draining thread, which also
+                # gates how fast frames reach disk, so it has to stay a
+                # pointer hand-off. This thread is the one that can afford
+                # the work. apply() copies, so the arrays still queued for
+                # saving as ir_left/ir_right PNGs are untouched.
+                left_mask, right_mask = self.gripper_masks
+                left_gray = left_mask.apply(left_gray)
+                right_gray = right_mask.apply(right_gray)
             call_start = time.monotonic()
             if self._last_call_start is not None:
                 self._call_gaps.append(call_start - self._last_call_start)
@@ -1034,6 +1064,32 @@ def parse_args() -> argparse.Namespace:
                          help="Also launch ORB-SLAM3's own Pangolin 3D map viewer window (default: off -- "
                               "this script's own --monitor window already gives live feedback; the Pangolin "
                               "viewer is mainly for standalone debugging of tracking/map quality).")
+    parser.add_argument("--gripper-mask", dest="gripper_mask", action=argparse.BooleanOptionalAction,
+                         default=True,
+                         help="Blank the wrist-mounted gripper out of the stereo frames before ORB-SLAM3 sees "
+                              "them (default: on). The gripper is rigidly attached to the camera and covers "
+                              "~8%% of the frame, so its features never move in the image -- which reads as "
+                              "evidence the camera didn't move, and gets baked into a saved atlas as map "
+                              "points at bogus world positions. See camera/gripper_mask.py. Use "
+                              "--no-gripper-mask to feed raw frames (e.g. to A/B the difference). Only "
+                              "affects what tracking sees; the saved ir_left/ir_right PNGs are always raw.")
+    parser.add_argument("--orbslam-map-dir", type=Path, default=None, dest="orbslam_map_dir",
+                         help="Directory containing a pre-built atlas.osa (see output_script/build_atlas_map.py) "
+                              "to LOCALIZE against instead of cold-starting a fresh map each episode -- avoids "
+                              "the 'not enough motion for initializing' reset loop that careful/precise "
+                              "manipulation can trigger from scratch (see ORB_SLAM3/config/"
+                              "RealSense_D435i_ours_relocalize.yaml's comment for the full mechanism). When set, "
+                              "--orbslam-settings is ignored in favor of RealSense_D435i_ours_relocalize.yaml "
+                              "(or --orbslam-relocalize-settings if given), and the process temporarily chdir()s "
+                              "into this directory while constructing each episode's OrbSlamTracker (ORB-SLAM3 "
+                              "hardcodes the load path as ./atlas.osa relative to the process's cwd at "
+                              "construction time -- not configurable). Default: None (cold-start each episode, "
+                              "today's original behavior).")
+    parser.add_argument("--orbslam-relocalize-settings", type=Path, default=ORBSLAM_DEFAULT_RELOCALIZE_SETTINGS_PATH,
+                         dest="orbslam_relocalize_settings",
+                         help=f"Settings YAML to use when --orbslam-map-dir is set (must have "
+                              f"System.LoadAtlasFromFile pointed at that dir's atlas). "
+                              f"Default: {ORBSLAM_DEFAULT_RELOCALIZE_SETTINGS_PATH}")
 
     # Live OpenVINS (monocular) tracking -- see openvins_bridge.py. Off by
     # default now (see module-level comment above DEFAULT_OPENVINS_CONFIG);
@@ -1073,9 +1129,57 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def construct_orb_tracker(args: argparse.Namespace) -> "OrbSlamTracker | None":
+    """Builds this episode's ORB-SLAM3 tracker -- either a fresh cold-start
+    map (default), or localizing against a pre-built atlas via
+    --orbslam-map-dir (see that flag's help and
+    ORB_SLAM3/config/RealSense_D435i_ours_relocalize.yaml's comment for the
+    mechanism/why).
+
+    Handles the required os.chdir() dance for the map-dir case: ORB-SLAM3
+    hardcodes the atlas load path as ./atlas.osa relative to the process's
+    cwd AT CONSTRUCTION TIME (not configurable -- see System::LoadAtlas in
+    ORB_SLAM3/src/System.cc), so this temporarily chdirs into
+    --orbslam-map-dir, constructs, then chdirs back before returning --
+    the caller's cwd is unchanged either way, including if construction
+    raises. Safe to call from the main per-episode setup block specifically
+    BECAUSE it runs synchronously there, before any other thread (camera
+    saving, servo polling) is doing its own relative-path file I/O that a
+    process-wide chdir could otherwise race with."""
+    if not args.orbslam:
+        return None
+    if args.orbslam_map_dir is None:
+        return OrbSlamTracker(args.orbslam_settings, args.orbslam_vocab, args.orbslam_lib,
+                               use_viewer=args.orbslam_viewer)
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(args.orbslam_map_dir)
+        return OrbSlamTracker(args.orbslam_relocalize_settings, args.orbslam_vocab, args.orbslam_lib,
+                               use_viewer=args.orbslam_viewer)
+    finally:
+        os.chdir(original_cwd)
+
+
 def main() -> int:
     args = parse_args()
     rs = cam.import_realsense()
+
+    # Built once for the whole session: the gripper is bolted to the camera,
+    # so its footprint is the same in every episode. Best-effort -- a missing
+    # or malformed spec degrades to unmasked tracking with a warning rather
+    # than taking down a recording session, since the operator may well be
+    # mid-demo when they find out.
+    gripper_masks = None
+    if args.orbslam and args.gripper_mask:
+        try:
+            gripper_masks = load_stereo_masks()
+            h, w = 480, 848
+            print(f"[orbslam] gripper mask on -- blanking "
+                  f"{100 * gripper_masks[0].coverage((h, w)):.1f}% of each IR frame before tracking "
+                  f"(saved PNGs stay raw). See camera/gripper_mask.py.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[orbslam] WARNING: could not load the gripper mask ({exc}) -- tracking on raw frames, "
+                  f"which lets camera-fixed gripper features into the map.")
 
     gripper_calib: tuple[np.ndarray, np.ndarray] | None = None
     if args.gripper_calibration_csv is not None:
@@ -1288,12 +1392,7 @@ def main() -> int:
                 orb_worker.close()
             if orb_tracker is not None:
                 orb_tracker.close()
-            orb_tracker = (
-                OrbSlamTracker(args.orbslam_settings, args.orbslam_vocab, args.orbslam_lib,
-                                use_viewer=args.orbslam_viewer)
-                if args.orbslam
-                else None
-            )
+            orb_tracker = construct_orb_tracker(args)
             orb_trajectory: list[dict[str, Any]] = []
             orb_last_print = [0.0]  # mutable box, see _on_orb_pose
             orb_last_map_epoch: list[int | None] = [None]  # mutable box, see _on_orb_pose
@@ -1353,7 +1452,10 @@ def main() -> int:
                          "is_lost": 1, "map_epoch": map_epoch}
                     )
 
-            orb_worker = OrbSlamWorker(orb_tracker, _on_orb_pose) if orb_tracker is not None else None
+            orb_worker = (
+                OrbSlamWorker(orb_tracker, _on_orb_pose, gripper_masks=gripper_masks)
+                if orb_tracker is not None else None
+            )
             # ORB-SLAM3's feed_imu wants one already-paired gyro+accel sample
             # per call (unlike OpenVinsTracker, which does its own gyro/accel
             # fusion internally) -- track the latest gyro reading here and
@@ -1592,8 +1694,15 @@ def main() -> int:
                     "color_fps_requested": args.color_fps,
                     "orbslam": (
                         {
-                            "settings_path": str(args.orbslam_settings),
+                            "settings_path": str(
+                                args.orbslam_relocalize_settings if args.orbslam_map_dir is not None
+                                else args.orbslam_settings
+                            ),
                             "vocab_path": str(args.orbslam_vocab),
+                            # None when this episode cold-started a fresh map (today's
+                            # original behavior); set when it localized against a
+                            # pre-built one instead -- see --orbslam-map-dir.
+                            "map_dir": str(args.orbslam_map_dir) if args.orbslam_map_dir is not None else None,
                             "frames_tracked": sum(1 for r in orb_trajectory if r["is_lost"] == 0),
                             "frames_total": len(orb_trajectory),
                             "trajectory_path": "camera_trajectory.csv",

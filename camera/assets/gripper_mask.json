@@ -1,0 +1,157 @@
+{
+ "_comment": [
+  "Polygon outline of the wrist-mounted gripper as it appears in this rig's",
+  "IR streams -- the region ORB-SLAM3 must NOT extract features from.",
+  "Derived, not hand-drawn: anything rigidly attached to the camera stays",
+  "sharp in a long temporal average while world content blurs away as the",
+  "camera moves, so gradient magnitude of the temporal mean isolates it.",
+  "Fitted by voting that test across 12 independent samples (4 time slices",
+  "x 3 recordings), keeping pixels flagged in >=50% of them, then keeping",
+  "only blobs touching the bottom image edge (where the gripper enters",
+  "frame) and dilating 10px for finger open/close travel.",
+  "Measured extent was stable to +-0.1% of frame area across all three",
+  "recordings, with the top edge landing on row 371-372 every time.",
+  "Left/right polygons differ by roughly the stereo disparity, as expected.",
+  "Validated by eye on scan_0007, which was NOT used to fit it.",
+  "NOTE: describes the post-reassembly gripper (see commit a03a448).",
+  "scan_0001..scan_0005 predate this mounting and some have no gripper in",
+  "frame at all -- re-derive with scripts if the gripper is remounted."
+ ],
+ "resolution": [
+  848,
+  480
+ ],
+ "source_scans": [
+  "scan_0006",
+  "scan_0008",
+  "scan_0009"
+ ],
+ "ir_left": [
+  [
+   [
+    256,
+    462
+   ],
+   [
+    256,
+    479
+   ],
+   [
+    756,
+    479
+   ],
+   [
+    755,
+    461
+   ],
+   [
+    736,
+    459
+   ],
+   [
+    714,
+    429
+   ],
+   [
+    685,
+    422
+   ],
+   [
+    639,
+    372
+   ],
+   [
+    622,
+    363
+   ],
+   [
+    568,
+    370
+   ],
+   [
+    558,
+    422
+   ],
+   [
+    444,
+    423
+   ],
+   [
+    402,
+    422
+   ],
+   [
+    380,
+    366
+   ],
+   [
+    326,
+    361
+   ],
+   [
+    310,
+    371
+   ]
+  ]
+ ],
+ "ir_right": [
+  [
+   [
+    527,
+    463
+   ],
+   [
+    493,
+    380
+   ],
+   [
+    460,
+    359
+   ],
+   [
+    418,
+    368
+   ],
+   [
+    392,
+    425
+   ],
+   [
+    235,
+    430
+   ],
+   [
+    229,
+    371
+   ],
+   [
+    184,
+    363
+   ],
+   [
+    157,
+    372
+   ],
+   [
+    93,
+    431
+   ],
+   [
+    67,
+    436
+   ],
+   [
+    20,
+    461
+   ],
+   [
+    16,
+    479
+   ],
+   [
+    527,
+    479
+   ]
+  ]
+ ]
+}

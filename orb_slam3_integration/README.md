@@ -105,9 +105,85 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
   downstream training-data use). Also auto-enables stereo IR capture
   (`camera/camera_collecting.py`'s `record_ir`) since Stereo-Inertial tracking needs
   both IR streams, not just color.
+- `output_script/build_atlas_map.py` + `synced_capture.py --orbslam-map-dir` -- the
+  two-stage approach: build a persistent map ONCE from a deliberate mapping pass, then
+  LOCALIZE every demo against it rather than cold-starting a fresh map per episode.
+  See the **Two-stage mapping** section below.
+- `camera/camera_collecting.py`'s `_set_emitter_for_depth()` -- switches the D435i's IR
+  projector OFF whenever the IR streams are feeding ORB-SLAM3 (ON only when the depth
+  stream is actually running, which needs it). The projected dot pattern is
+  *camera-fixed*, not world-fixed: the dots slide across surfaces as the camera moves,
+  so they are not valid landmarks, and they're near-identical to each other so their
+  descriptors mismatch easily. This matches where upstream draws the line -- ORB-SLAM3's
+  own Stereo, Stereo-Inertial, Monocular and Calibration RealSense examples all switch
+  the emitter off; only the RGB-D ones (which consume the depth map, not IR features)
+  leave it on.
 
 Run `output_script/synced_capture.py --help` for the full flag list, or see this
 directory's patch/new-file comments for anything not covered above.
+
+## Two-stage mapping (build once, localize per demo)
+
+Live testing showed Stereo-Inertial failing catastrophically during careful, precise
+pick-and-place -- near-constant resets, ~33% of frames tracked, every tracked segment
+only ~3 frames long -- **after** low texture and motion blur had both been independently
+ruled out as the cause. Root cause, traced into `LocalMapping.cc`: IMU initialization
+requires accumulated keyframe-to-keyframe translation >= 2cm within a ~10s window or it
+resets ("Not enough motion for initializing"). Precise manipulation has small net
+displacement by nature, so a map cold-started from inside a single short, careful demo
+may simply never clear that bar. The official UMI pipeline
+(`scripts_slam_pipeline/03_batch_slam.py`) never hits this because it never cold-starts
+a map from a demo's own motion.
+
+```bash
+# 1. Build the map ONCE -- expansive, unhurried motion over the whole workspace.
+python3 output_script/build_atlas_map.py --output-dir maps/kitchen_table
+
+# 2. Every demo localizes against it instead of cold-starting.
+python3 output_script/synced_capture.py --orbslam-map-dir maps/kitchen_table
+```
+
+**Why loading a map actually removes the reset**, rather than just making it less likely:
+`Map.h`'s `serialize()` includes `mbImuInitialized` / `mbIsInertial` / `mbIMU_BA1` /
+`mbIMU_BA2` in what gets written to the `.osa`. A map built by a proper mapping pass
+saves with `GetIniertialBA2() == true`, and the reset above is gated specifically on
+`!GetIniertialBA2()` -- so a loaded, already-BA2-complete map never re-triggers it, no
+matter how small the demo's own motion is. The hard part (cold initialization) happens
+once, offline; each demo only does the easier part.
+
+Mechanics worth knowing before running either half:
+
+- ORB-SLAM3 hardcodes both the save and load path as `"./" + name + ".osa"`, relative to
+  the **process's cwd at the moment the `System` is constructed** -- not configurable.
+  `build_atlas_map.py` `chdir`s into `--output-dir` before starting; `synced_capture.py`'s
+  `construct_orb_tracker()` chdirs in, constructs, and chdirs back (see its docstring for
+  why that's thread-safe where it's called).
+- The atlas is checksum-verified against the **vocabulary file** used to build it -- don't
+  point `--orbslam-vocab` at a different `ORBvoc.txt` between the two stages.
+- Saving/loading needs no C API changes: `System::Shutdown()` calls `SaveAtlas()` when
+  `System.SaveAtlasToFile` is set, and the constructor calls `LoadAtlas()` when
+  `System.LoadAtlasFromFile` is. Hence the two config variants,
+  `config/RealSense_D435i_ours_mapping.yaml` and `..._relocalize.yaml` -- identical
+  calibration to `..._ours.yaml`, plus that one key.
+
+### Scene texture
+
+With the emitter off (above), the workspace has to supply its own **world-fixed** texture.
+Adding it deliberately -- printed patterns stuck around the manipulation region -- is the
+intended way to do that. Two constraints:
+
+- They are used **only as ordinary ORB features**. Nothing in this project detects them as
+  markers and no pose is derived from their geometry (there is no `aruco`/`apriltag` code
+  anywhere here, deliberately). Deriving pose from marker geometry would tie the recorded
+  trajectories to an instrumented environment, which defeats the point for policies that
+  have to run in un-instrumented ones.
+- Tracking happens in **near-IR**, where many colored dyes are effectively transparent.
+  Use black-on-white laser-printed patterns, non-repeating (a regular grid produces
+  ambiguous descriptors), at mixed scales.
+
+Whatever texture is present during the mapping pass is baked into the atlas as map points,
+so it must stay physically put between mapping and the demos that localize against it.
+Rearranging it means re-running `build_atlas_map.py`.
 
 ## Known limitations (as of this integration)
 
@@ -118,4 +194,51 @@ directory's patch/new-file comments for anything not covered above.
 - ORB-SLAM3 resets mid-recording are real and were observed live (not rare) --
   `map_epoch` in `camera_trajectory.csv` flags them, but nothing downstream currently
   *acts* on that (e.g. splitting an episode into per-segment trajectories for training).
-  That's the next piece of work, not yet built.
+  The two-stage approach above is aimed squarely at removing the dominant cause of those
+  resets, so per-segment splitting may end up unnecessary -- but `map_epoch` is still the
+  thing to check to find out, and nothing consumes it yet either way.
+- **None of the two-stage path has been validated on hardware yet.** The mapping script,
+  the `--orbslam-map-dir` localize path, and the emitter change are all written and
+  compile, but no live run has confirmed that resets actually drop. The order to test in:
+  put the scene texture up, run `build_atlas_map.py` and watch its tracked/total ratio,
+  then record a demo with `--orbslam-map-dir` and compare reset counts against a
+  cold-start run.
+- `IR_EXPOSURE_CAP_US` (`camera/camera_collecting.py`) was chosen to stop the *emitter's
+  dot pattern* smearing under handheld motion. With the emitter now off for tracking, that
+  basis no longer holds -- real world-fixed texture has a different blur budget, so the
+  value needs re-measuring rather than assuming it still applies.
+
+- **A grasped object becomes camera-fixed for as long as it's held, and nothing handles
+  that.** The static gripper mask cannot: where a held object lands in frame depends on
+  where and how it was grasped. Measured on existing recordings with a sliding 1.5s
+  temporal-mean sharpness test (the same camera-fixed detector used to derive the gripper
+  mask, minus the known gripper region), the signal is real and lines up with grasp
+  phases -- scan_0009 shows eight consecutive elevated windows from 12s, scan_0007 shows
+  19 of 26. During those windows the held object is ~2.3-2.8% of the frame but takes
+  **11-13% of the features that remain after gripper masking** (104 of 786 per frame in
+  scan_0009; 91 of 798 in scan_0007).
+
+  Probably survivable as-is: `Optimizer::PoseOptimization` uses a Huber robust kernel
+  (`thHuber2D = sqrt(5.99)`, `src/Optimizer.cc`) and four rounds of chi-squared outlier
+  rejection (`if(e->chi2() > 5.991) ... nBad++`), which is exactly the mechanism for a
+  minority of points whose motion disagrees with the rest. 11-13% is a clear minority.
+
+  Three reasons not to treat that as settled: (1) it's a minority *in these recordings* --
+  a closer grasp, a larger object, or a view pointed at the blankest part of the workspace
+  could multiply it, and this scene is texture-poor to begin with; (2) the object was
+  mapped in its pre-grasp position, so after it moves those map points are stale and can
+  mis-associate -- that pollutes the *map*, which outlives any single frame's pose, and it
+  is baked into `atlas.osa` if it happens during the mapping pass; (3) it happens
+  precisely during the careful, small-displacement phase that is already closest to the
+  IMU-init motion threshold.
+
+  Deliberately not fixed in code. A static mask can't cover it, and per-frame dynamic
+  rejection would be re-implementing what the robust kernel already does, with more ways
+  to get it wrong. The real lever is the denominator: strong world-fixed texture *around*
+  the manipulation region dilutes the object's share and gives outlier rejection a solid
+  inlier majority to work against -- which is the reason for putting added texture around
+  the workspace rather than in it. One cheap option held in reserve: extending the gripper
+  mask upward by 40-60px would cover much of where held objects sit (they appear directly
+  above the current boundary), at the cost of the manipulation region's own pixels -- which
+  are pixels SLAM wants nothing from anyway. Not done blind; decide it against live
+  `camera_trajectory.csv` behaviour during grasp phases once the scene texture is in place.
