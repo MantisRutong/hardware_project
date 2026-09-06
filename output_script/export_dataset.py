@@ -222,6 +222,42 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+def demo_start_timestamp(episode_dir: Path) -> float | None:
+    """Seconds (host clock) where the demonstration itself starts, or None
+    if this episode was not marked.
+
+    A recording opens with warm-up -- deliberate sweeping so ORB-SLAM3 can
+    relocalize into the loaded atlas. Those frames have to be RECORDED
+    (replay_slam.py has nothing else to relocalize from) but must not be
+    TRAINED on: measured on scan_0011, the first grasp is at t=46s of a
+    61.5s recording, and before it the trajectory sweeps 25-46cm per 5s
+    window with the gripper wide open throughout. Exported unmarked, about
+    two thirds of that episode teaches the policy to sweep with an open
+    gripper -- and it passes every check here, because every frame really
+    is well tracked, well synced and correctly labelled. It is simply not
+    the demonstration.
+
+    The mark comes from a keypress during recording (synced_capture.py's
+    'm'), not from a heuristic. The obvious heuristic -- first gripper
+    closure -- is wrong: approaching an object with the gripper open is part
+    of the demonstration, and some tasks start already holding something.
+    The reference UMI pipeline does not guess either; its
+    06_generate_dataset_plan.py filters on a check_result.txt a human wrote
+    after watching the video.
+
+    Returns seconds rather than ns to match camera_trajectory.csv's own
+    timestamp column, which is host_time_ns / 1e9."""
+    meta_path = episode_dir / "metadata.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    ns = meta.get("demo_start_host_ns")
+    return None if ns is None else float(ns) / 1e9
+
+
 def camera_trajectory_path(episode_dir: Path) -> Path:
     """Prefer the refined trajectory when the episode has one.
 
@@ -379,6 +415,7 @@ def process_episode(
     min_segment_frames: int,
     max_rgb_offset_ms: float,
     max_speed_mps: float = DEFAULT_MAX_SPEED_MPS,
+    respect_demo_start: bool = True,
 ) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]]]:
     """Returns (segments, reports) -- segments is a list of per-episode row
     lists (each inner list is one replay-buffer episode: a surviving
@@ -398,6 +435,25 @@ def process_episode(
     segment (including skipped ones) for the conversion report."""
     trajectory_rows = read_csv(camera_trajectory_path(episode_dir))
     host_ns, synced_rows = load_synced_index(episode_dir)
+
+    # Warm-up is dropped BEFORE segmenting, not after, so a coordinate-frame
+    # split that happened during the warm-up cannot produce a segment made
+    # entirely of frames that are then discarded anyway -- and so the
+    # reported segments are the ones actually exported.
+    demo_start = demo_start_timestamp(episode_dir) if respect_demo_start else None
+    demo_report: dict[str, Any] = {"episode_dir": str(episode_dir)}
+    if demo_start is None:
+        demo_report.update({"status": "no_demo_start_mark", "frames": len(trajectory_rows)})
+    else:
+        before = len(trajectory_rows)
+        trajectory_rows = [r for r in trajectory_rows if float(r["timestamp"]) >= demo_start]
+        demo_report.update({
+            "status": "trimmed_to_demo_start",
+            "demo_start_timestamp": demo_start,
+            "frames_before_demo_start": before - len(trajectory_rows),
+            "frames": len(trajectory_rows),
+        })
+
     segments, jumps = segment_tracked_rows(trajectory_rows, max_speed_mps)
 
     out_segments: list[list[dict[str, Any]]] = []
@@ -405,7 +461,8 @@ def process_episode(
     # merge leaves no other trace, so this is the only place the fact that
     # one happened is written down. Also what tells a refined trajectory
     # (expected: none) from a live one.
-    reports: list[dict[str, Any]] = [{"episode_dir": str(episode_dir), **j} for j in jumps]
+    reports: list[dict[str, Any]] = [demo_report]
+    reports += [{"episode_dir": str(episode_dir), **j} for j in jumps]
     for seg_idx, segment in enumerate(segments):
         map_epoch = _epoch_of(segment[0])
         if len(segment) < min_segment_frames:
@@ -528,6 +585,11 @@ def main() -> None:
                               "means ORB-SLAM3 moved the map origin (an atlas merge) rather than the camera "
                               f"moving (default: {DEFAULT_MAX_SPEED_MPS} m/s, umi_teleop.py's POSE_JUMP_MPS). "
                               "0 disables the check; map_epoch splitting is unconditional either way.")
+    parser.add_argument("--ignore-demo-start", dest="respect_demo_start", action="store_false", default=True,
+                         help="Export the warm-up too, instead of starting each episode at its marked demo "
+                              "start (synced_capture.py's 'm' keypress). Only useful for reproducing an "
+                              "older export; the warm-up is sweeping motion with the gripper open, recorded "
+                              "so ORB-SLAM3 can relocalize, and it is not the demonstration.")
     args = parser.parse_args()
 
     episodes = expand_episode_dirs(args.inputs)
@@ -542,7 +604,8 @@ def main() -> None:
     # from len(episodes) -- see module docstring.
     for episode_dir in episodes:
         segments, reports = process_episode(episode_dir, args.min_segment_frames,
-                                            args.max_rgb_offset_ms, args.max_speed_mps)
+                                            args.max_rgb_offset_ms, args.max_speed_mps,
+                                            args.respect_demo_start)
         all_reports.extend(reports)
         for segment_rows in segments:
             all_rows.extend(segment_rows)
@@ -650,6 +713,23 @@ def main() -> None:
     print(json.dumps({k: v for k, v in summary.items() if k != "segment_reports"}, indent=2))
     print(f"Wrote {args.output} ({n} frames, {len(episode_ends)} episodes). Full report: "
           f"{args.output / 'conversion_report.json'}")
+
+    # Loud, because the failure it warns about is silent: an unmarked
+    # episode exports its warm-up as demonstration and every check here
+    # passes, since those frames really are well tracked and well synced.
+    # Nothing downstream can tell them apart either.
+    unmarked = [r["episode_dir"] for r in all_reports if r.get("status") == "no_demo_start_mark"]
+    if unmarked and args.respect_demo_start:
+        print(f"\nWARNING: {len(unmarked)} of {len(episodes)} episodes have no demo-start mark, so their "
+              f"warm-up is exported as demonstration:", file=sys.stderr)
+        for d in unmarked:
+            print(f"  {d}", file=sys.stderr)
+        print("Press 'm' in synced_capture.py's monitor window when the demo starts. Recordings made "
+              "before that keypress existed will always land here.", file=sys.stderr)
+    trimmed = [r for r in all_reports if r.get("status") == "trimmed_to_demo_start"]
+    if trimmed:
+        total_dropped = sum(r["frames_before_demo_start"] for r in trimmed)
+        print(f"\nDropped {total_dropped} warm-up frames across {len(trimmed)} marked episodes.")
 
 
 if __name__ == "__main__":

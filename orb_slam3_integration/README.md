@@ -225,6 +225,51 @@ default) or they can never be re-tracked. And an episode recorded this way has n
 `replay_slam.py` writes -- which is why `export_dataset.py` accepts either
 (`has_trajectory`).
 
+### Marking where the demonstration starts
+
+A recording opens with warm-up: deliberate sweeping so ORB-SLAM3 can relocalize into the
+loaded atlas. Those frames must be **recorded** -- `replay_slam.py` has nothing else to
+relocalize from -- and must not be **trained on**. Measured on scan_0011: the first grasp
+is at t=46s of a 61.5s recording, and before it the camera sweeps 25-46cm per 5s window
+with the gripper sitting at 80.0mm (wide open) throughout. Exported unmarked, about two
+thirds of that episode teaches the policy to sweep with an open gripper -- and it passes
+every check in the exporter, because those frames really are well tracked, well synced
+and correctly labelled. They are simply not the demonstration.
+
+Press **`m`** in the monitor window when the demo itself begins:
+
+```
+Enter/Space   start recording
+              (warm-up: translate 20-30cm across the workspace)
+m             mark: the demonstration starts here
+              (the task)
+Enter/Space   stop
+```
+
+The border turns green and the window shows `DEMO +40.2s`, so a press that missed is
+obvious. Pressing again overwrites, so marking too early is fixed by marking again. The
+timestamp lands in `metadata.json` as `demo_start_host_ns` (host clock, the same one
+every stream is stamped with, so no conversion is needed to compare it with
+`frames.csv`), and `export_dataset.py` drops everything before it -- before segmenting,
+so reported segments are the ones actually exported.
+
+Unmarked episodes export in full, as they always did, but the exporter now says so on
+stderr rather than letting it pass silently. `--ignore-demo-start` reproduces the old
+behaviour.
+
+Nothing infers this boundary, deliberately. The tempting heuristic -- first gripper
+closure -- is wrong: approaching an object with the gripper open is part of the
+demonstration, and some tasks start already holding something. The reference UMI pipeline
+does not guess either; its `06_generate_dataset_plan.py` filters on a `check_result.txt`
+a human wrote after watching the video. This is the same judgement, moved to the moment
+it is obvious.
+
+`demo_start_offset_s` is also worth watching on its own: it is the warm-up cost. UMI's
+own demos need no warm-up, because the mapping pass is a separate video and each demo
+relocalizes immediately against a map of a well-textured scene. If the workspace texture
+does its job, this number should fall from ~40s toward a few seconds -- which makes it a
+direct measure of whether there is enough of it.
+
 ### Limits, measured
 
 Replaying does not rescue a recording whose scene was untrackable. scan_0006-0009 were

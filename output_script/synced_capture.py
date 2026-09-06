@@ -512,6 +512,11 @@ class CombinedMonitor:
     # to start" otherwise. See recording_active in __init__.
     RECORDING_COLOR = (0, 0, 220)   # BGR: red
     IDLE_COLOR = (140, 140, 140)    # BGR: gray
+    # Recording AND the demo-start mark is set -- distinct from plain
+    # recording red so "did that keypress register" is answerable at a
+    # glance from across the room. Green because the useful part is what is
+    # being recorded from here on.
+    DEMO_COLOR = (0, 190, 0)        # BGR: green
     STATUS_BORDER_PX = 8
 
     def __init__(
@@ -526,6 +531,7 @@ class CombinedMonitor:
         on_start_requested: "Any" = None,
         recording_active: "Any" = None,
         on_episode_stop_requested: "Any" = None,
+        on_demo_start_requested: "Any" = None,
     ):
         self.cv2 = cv2_module
         self.window_seconds = window_seconds
@@ -555,6 +561,33 @@ class CombinedMonitor:
         # q/Esc/close, via on_stop_requested, actually stopped anything, and
         # that also aborts the whole batch, not just this episode).
         self.on_episode_stop_requested = on_episode_stop_requested
+        # Optional -- called (from this monitor thread) when 'm' is pressed
+        # WHILE recording, to mark where the demonstration itself starts.
+        #
+        # A recording begins with warm-up: deliberate sweeping motion so
+        # ORB-SLAM3 can relocalize into the loaded atlas. That motion is
+        # necessary to RECORD (replay_slam.py has nothing else to relocalize
+        # from) and useless to TRAIN on -- measured on scan_0011, the first
+        # grasp is at t=46s of a 61.5s recording, and the trajectory before
+        # it sweeps 25-46cm per 5s window while the gripper sits at 80.0mm,
+        # i.e. wide open, the whole time. Exported unmarked, roughly two
+        # thirds of that episode teaches the policy to sweep.
+        #
+        # Nothing can infer this boundary reliably. The obvious heuristic --
+        # first gripper closure -- is wrong: approaching an object with the
+        # gripper open is part of the demonstration, and some tasks start
+        # already holding something. The reference UMI pipeline does not
+        # guess either; its 06_generate_dataset_plan.py filters on a
+        # check_result.txt a human wrote after watching the video. This is
+        # the same human judgement, moved to the moment it is obvious.
+        #
+        # Idempotent in the sense that matters: pressing again overwrites,
+        # so marking too early is fixed by marking again.
+        self.on_demo_start_requested = on_demo_start_requested
+        # Set by main() once 'm' has been pressed this episode, purely so
+        # the window can say so -- without feedback there is no way to tell
+        # a press that registered from one that missed.
+        self.demo_start_offset_s: float | None = None
         # Optional -- the same threading.Event RealSenseCapture/ServoPoller
         # already use to gate whether frames/samples actually get recorded
         # (capture.active). Read-only here, both to show the recording
@@ -707,8 +740,17 @@ class CombinedMonitor:
         # this never touches the original pending frame buffer.
         is_recording = self.recording_active is not None and self.recording_active.is_set()
         border_color = self.RECORDING_COLOR if is_recording else self.IDLE_COLOR
+        if is_recording and self.demo_start_offset_s is not None:
+            border_color = self.DEMO_COLOR
         cv2.rectangle(combined, (0, 0), (combined.shape[1] - 1, combined.shape[0] - 1),
                       border_color, self.STATUS_BORDER_PX)
+        # Text as well as colour: the offset is the thing worth reading back
+        # (it is how long the warm-up took), and colour alone cannot carry it.
+        if is_recording:
+            label = (f"DEMO +{self.demo_start_offset_s:.1f}s" if self.demo_start_offset_s is not None
+                     else "warm-up -- press 'm' when the demo starts")
+            cv2.putText(combined, label, (12, combined.shape[0] - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, border_color, 2, cv2.LINE_AA)
 
         cv2.imshow(self.WINDOW_NAME, combined)
         key = cv2.waitKey(1) & 0xFF
@@ -731,6 +773,14 @@ class CombinedMonitor:
                     self.on_episode_stop_requested()
             elif self.on_start_requested is not None:
                 self.on_start_requested()
+        # 'm' = mark where the demonstration starts, i.e. where warm-up ends
+        # -- see on_demo_start_requested in __init__. Only meaningful while
+        # recording; ignored otherwise rather than silently remembered, so
+        # it cannot leak into the next episode.
+        elif key == ord("m"):
+            if (self.recording_active is not None and self.recording_active.is_set()
+                    and self.on_demo_start_requested is not None):
+                self.on_demo_start_requested()
 
     def close(self) -> None:
         """Ask the monitor thread to stop and wait briefly for it -- safe to
@@ -1688,8 +1738,36 @@ def main() -> int:
             cam.write_calibration(rs, capture.profile, scan_dir / "calibration.json", args.depth_flag)
 
             start_event = threading.Event()
+            # Host clock, in a one-element list so the monitor thread's
+            # callback can write it and the metadata block below can read
+            # it -- same pattern the per-episode ORB-SLAM3 state uses. None
+            # until 'm' is pressed, and None is a meaningful value: it means
+            # this episode has no marked demo start, which export_dataset.py
+            # reports rather than silently treating the warm-up as demo.
+            demo_start_host_ns: list[int | None] = [None]
             if monitor is not None:
                 monitor.on_start_requested = start_event.set
+                monitor.demo_start_offset_s = None  # this episode's own mark, not the last one's
+
+                def _on_demo_start(
+                    mon: Any = monitor,
+                    holder: list[int | None] = demo_start_host_ns,
+                    cap: Any = capture,
+                ) -> None:
+                    """Runs on the monitor thread when 'm' is pressed while
+                    recording. time.time_ns() is the same clock every stream
+                    is already stamped with (host_time_ns everywhere in this
+                    file), so the mark needs no conversion to be comparable
+                    with frames.csv."""
+                    now_ns = time.time_ns()
+                    holder[0] = now_ns
+                    first = cap.frame_rows[0]["host_time_ns"] if cap.frame_rows else now_ns
+                    offset = (now_ns - first) / 1e9
+                    mon.demo_start_offset_s = offset
+                    print(f"\n[demo] start marked at +{offset:.1f}s -- everything before this is warm-up "
+                          f"and will be dropped on export.")
+
+                monitor.on_demo_start_requested = _on_demo_start
 
             print(f"\n=== Episode {episode_idx}/{args.episodes} -- output: {scan_dir} ===")
             print("Press Enter to start capture (in this terminal, or in the monitor window if it has focus)...")
@@ -1709,7 +1787,8 @@ def main() -> int:
                 break
 
             def _wait_for_stop(event: threading.Event = capture.stop_event) -> None:
-                input("Recording... press Enter to stop.\n")
+                input("Recording... press 'm' in the monitor window when the demo itself starts "
+                      "(everything before it is warm-up), then Enter here to stop.\n")
                 event.set()
 
             threading.Thread(target=_wait_for_stop, daemon=True).start()
@@ -1814,6 +1893,16 @@ def main() -> int:
                     "script": Path(__file__).name,
                     "episode_index": episode_idx,
                     "episodes_requested": args.episodes,
+                    # Where the demonstration itself starts, if 'm' was
+                    # pressed (see CombinedMonitor.on_demo_start_requested).
+                    # Absent/null means unmarked -- export_dataset.py then
+                    # exports the whole episode and says so, rather than
+                    # guessing where the warm-up ended.
+                    "demo_start_host_ns": demo_start_host_ns[0],
+                    "demo_start_offset_s": (
+                        round((demo_start_host_ns[0] - capture.frame_rows[0]["host_time_ns"]) / 1e9, 2)
+                        if demo_start_host_ns[0] is not None and capture.frame_rows else None
+                    ),
                     "servo": {
                         "port": port,
                         "baud": args.servo_baud,
