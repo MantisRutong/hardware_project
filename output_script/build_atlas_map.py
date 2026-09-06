@@ -250,6 +250,15 @@ def main() -> int:
 
     try:
         capture.capture()
+    except KeyboardInterrupt:
+        # Ctrl+C is a perfectly reasonable way to end a mapping pass, and it
+        # used to skip the whole health report below: the finally clause ran
+        # (so the atlas was still saved -- Shutdown() is what writes it), but
+        # the exception then propagated straight out of main() before
+        # anything got a chance to say whether the atlas was any good. The
+        # one moment those numbers matter is right after the pass, while the
+        # scene is still set up and re-running costs a minute.
+        print("\n\nInterrupted -- finishing the atlas save and reporting anyway.")
     finally:
         worker.close()
         capture.stop_camera()
