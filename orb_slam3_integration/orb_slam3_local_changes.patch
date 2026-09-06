@@ -131,10 +131,10 @@ index e1e2717..8076d76 100644
      bool mHasViewer;
  
 diff --git a/include/System.h b/include/System.h
-index 872c86e..26c9b2b 100644
+index 872c86e..4dee255 100644
 --- a/include/System.h
 +++ b/include/System.h
-@@ -177,6 +177,23 @@ public:
+@@ -177,6 +177,43 @@ public:
      std::vector<MapPoint*> GetTrackedMapPoints();
      std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
  
@@ -154,6 +154,26 @@ index 872c86e..26c9b2b 100644
 +    // even though the origin does -- see Atlas.h's doc comment for the
 +    // full story.
 +    long unsigned int GetMapEpoch();
++
++    // Local addition (not upstream): the ACTIVE map's own id
++    // (Atlas::GetCurrentMap()->GetId()), which is the complement of
++    // GetMapEpoch() above rather than a substitute for it.
++    //
++    // GetMapEpoch() answers "did the origin move because of a RESET". This
++    // answers "which map am I in", and the case it exists for is the one
++    // GetMapEpoch() structurally cannot see: a MERGE. Loading an atlas does
++    // not put tracking into it -- the session cold-starts its own new map
++    // (visible as "Creation of new map with id: 1" after LoadAtlas) and
++    // tracks there until LoopClosing recognises the region and merges,
++    // at which point Atlas::ChangeMap() switches the active map to the
++    // atlas's. Neither touches the reset counter, so this id changing is
++    // the only in-process evidence that a merge happened.
++    //
++    // The practical use is live: "tracking is OK" does not mean "localized
++    // in the loaded atlas" -- it is equally true of the cold-started map,
++    // which is exactly the situation the atlas exists to avoid. Comparing
++    // this against the id the atlas loaded with distinguishes the two.
++    long unsigned int GetCurrentMapId();
 +
      // For debugging
      double GetTimeFromIMUInit();
@@ -292,7 +312,7 @@ index 93a50be..b26afad 100644
              if(settings.cameraType_ == Settings::PinHole || settings.cameraType_ ==  Settings::Rectified){
                  output << "Pinhole";
 diff --git a/src/System.cc b/src/System.cc
-index 60d9c51..e999bf8 100644
+index 60d9c51..8572bea 100644
 --- a/src/System.cc
 +++ b/src/System.cc
 @@ -21,6 +21,7 @@
@@ -367,7 +387,7 @@ index 60d9c51..e999bf8 100644
  
      if(!mStrSaveAtlasToFile.empty())
      {
-@@ -1324,6 +1355,14 @@ int System::GetTrackingState()
+@@ -1324,6 +1355,23 @@ int System::GetTrackingState()
      return mTrackingState;
  }
  
@@ -377,6 +397,15 @@ index 60d9c51..e999bf8 100644
 +    // call any time, no separate locking needed here (see System.h's and
 +    // Atlas.h's comments on this).
 +    return mpAtlas->GetResetGeneration();
++}
++
++long unsigned int System::GetCurrentMapId()
++{
++    // Atlas::GetCurrentMap() takes Atlas's own mutex, and Map::GetId()
++    // returns a value fixed at construction -- no extra locking needed
++    // here, same as GetMapEpoch() above.
++    Map* pMap = mpAtlas->GetCurrentMap();
++    return pMap ? pMap->GetId() : 0;
 +}
 +
  vector<MapPoint*> System::GetTrackedMapPoints()

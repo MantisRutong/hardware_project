@@ -76,6 +76,8 @@ class OrbSlamTracker:
         self._lib.orb_track_stereo.restype = ctypes.c_int
         self._lib.orb_shutdown.argtypes = [ctypes.c_void_p]
         self._lib.orb_shutdown.restype = None
+        self._lib.orb_get_current_map_id.argtypes = [ctypes.c_void_p]
+        self._lib.orb_get_current_map_id.restype = ctypes.c_long
         self._lib.orb_save_trajectory_tum.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         self._lib.orb_save_trajectory_tum.restype = None
         self._lib.orb_destroy.argtypes = [ctypes.c_void_p]
@@ -139,6 +141,30 @@ class OrbSlamTracker:
         treat poses across an epoch change as a continuous trajectory. 0
         before the first call."""
         return self._map_epoch_buf.value
+
+    @property
+    def current_map_id(self) -> int:
+        """The id of the map tracking is currently in.
+
+        Answers "am I in the loaded atlas yet", which no other signal here
+        does. LoadAtlas restores the saved map as id 0, but the session then
+        cold-starts its OWN map (id 1) and tracks in that -- the very cold
+        start the atlas exists to avoid -- until LoopClosing recognises the
+        region and merges, at which point Atlas::ChangeMap switches the
+        active map and this becomes 0 again.
+
+        So neither of the obvious signals answers the question:
+        track_stereo() returning a pose is equally true of the cold-started
+        map, and last_map_epoch never moves for a merge (a merge is not a
+        reset -- see that property's docstring). Watch this instead.
+
+        Unlike last_map_epoch, this queries ORB-SLAM3 on every access rather
+        than reading a value cached by the last track_stereo() call, since a
+        merge happens on the LoopClosing thread and can land between frames.
+        0 with no handle, or after shutdown()."""
+        if not self._handle:
+            return 0
+        return int(self._lib.orb_get_current_map_id(self._handle))
 
     def shutdown(self) -> None:
         """Stops ORB-SLAM3's internal threads. Call before save_trajectory_tum.

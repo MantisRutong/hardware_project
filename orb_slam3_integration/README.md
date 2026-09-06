@@ -270,6 +270,60 @@ relocalizes immediately against a map of a well-textured scene. If the workspace
 does its job, this number should fall from ~40s toward a few seconds -- which makes it a
 direct measure of whether there is enough of it.
 
+### Knowing, during a recording, whether the atlas is in use
+
+`--orbslam` (off by default) shows a relocalization indicator in the monitor window:
+
+```
+ATLAS OK -- merged, safe to press 'm'      green
+localizing... keep translating 20-30cm     amber
+TRACKING LOST                              red
+```
+
+It exists because "tracking is OK" does **not** mean "localized in the atlas". `LoadAtlas`
+restores the saved map, but the session then cold-starts its **own** map -- visible in the
+log as `Creation of new map with id: 1` right after the load -- and tracks in that, which
+is precisely the cold start the atlas exists to avoid. Only when `LoopClosing` recognises
+the region does `Atlas::ChangeMap` switch the active map to the atlas's. Tracking looks
+healthy throughout.
+
+`map_epoch` cannot show this (a merge is not a reset, so the counter never moves), so
+`System::GetCurrentMapId()` and `orb_get_current_map_id()` were added to expose the active
+map's id. A merge is detected as **the map id changing while `map_epoch` does not** -- a
+reset also changes the id, but bumps the epoch, so tracking each session map against its
+epoch means a reset re-arms the indicator rather than latching it green.
+
+**What it found immediately: on scan_0011, the merge never happens.** Replaying the whole
+episode against `maps/workspace`, the map id goes 1 → 2 and only ever alongside a
+`map_epoch` change, i.e. resets. It never reaches the atlas's own map:
+
+```
+t=+ 0.00s  map_id 1 -> 1   map_epoch None -> 1   RESET
+t=+ 2.70s  map_id 1 -> 1   map_epoch 1 -> 2      RESET
+t=+55.74s  map_id 1 -> 2   map_epoch 2 -> 3      RESET
+t=+59.48s  map_id 2 -> 2   map_epoch 3 -> 4      RESET
+```
+
+Two things follow, and both contradict claims made earlier in this file:
+
+- **The IMU-init bypass does not apply.** The gate reads `mpCurrentKeyFrame->GetMap()
+  ->GetIniertialBA2()` (`LocalMapping.cc`) -- the *current* map. That is the freshly
+  created session map, whose `mbIMU_BA2` is false, not the loaded atlas's. Serializing
+  the flag only helps once tracking is actually IN the loaded map. scan_0011 still reset
+  three times, consistent with the gate being live.
+- **The mid-episode coordinate shifts are not merges.** With no merge occurring they must
+  come from loop closure or bundle adjustment inside the session's own map, which applies
+  the same kind of rigid correction with the same invisibility to `map_epoch`. Everything
+  built on top -- the refined trajectory, the speed split -- is unaffected, since none of
+  it depends on *which* mechanism moved the keyframes. Only the naming was wrong.
+
+So the two-stage atlas is, at present, loading a map and not using it. The 33% → 98%
+improvement between scan_0009 and scan_0011 has to be attributed to something else, most
+likely the "translate, don't rotate" operating change (scan_0010, also with the atlas, got
+53%). Why relocalization never fires is open -- unproven candidates include the loaded
+keyframes not entering the place-recognition database, and the scene simply not being
+recognisable enough.
+
 ### Limits, measured
 
 Replaying does not rescue a recording whose scene was untrackable. scan_0006-0009 were

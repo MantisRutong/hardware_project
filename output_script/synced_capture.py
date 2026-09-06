@@ -517,6 +517,7 @@ class CombinedMonitor:
     # glance from across the room. Green because the useful part is what is
     # being recorded from here on.
     DEMO_COLOR = (0, 190, 0)        # BGR: green
+    WARN_COLOR = (0, 190, 220)      # BGR: amber -- working on it, not an error
     STATUS_BORDER_PX = 8
 
     def __init__(
@@ -588,6 +589,18 @@ class CombinedMonitor:
         # the window can say so -- without feedback there is no way to tell
         # a press that registered from one that missed.
         self.demo_start_offset_s: float | None = None
+        # Set by main()'s _on_orb_pose when an atlas is loaded: one of
+        # "localizing", "merged" or "lost". None means there is nothing to
+        # say -- no live tracker, or no --orbslam-map-dir -- and the panel
+        # stays quiet rather than showing a status that means nothing.
+        #
+        # This is the signal you need before pressing 'm', and it is not the
+        # same as "tracking works". LoadAtlas restores the saved map, but the
+        # session then cold-starts its OWN map and tracks in that -- exactly
+        # the cold start the atlas exists to avoid -- until LoopClosing
+        # merges. Tracking looks fine the whole time. See
+        # OrbSlamTracker.current_map_id.
+        self.atlas_status: str | None = None
         # Optional -- the same threading.Event RealSenseCapture/ServoPoller
         # already use to gate whether frames/samples actually get recorded
         # (capture.active). Read-only here, both to show the recording
@@ -651,6 +664,17 @@ class CombinedMonitor:
         status_color = self.RECORDING_COLOR if is_recording else self.IDLE_COLOR
         cv2.putText(panel, status_text, (margin, 38),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2 if is_recording else 1, cv2.LINE_AA)
+
+        # Atlas relocalization status, right under the recording line -- the
+        # thing to read before pressing 'm'. See self.atlas_status.
+        if self.atlas_status is not None:
+            atlas_text, atlas_color = {
+                "merged": ("ATLAS OK -- merged, safe to press 'm'", self.DEMO_COLOR),
+                "localizing": ("localizing... keep translating 20-30cm", self.WARN_COLOR),
+                "lost": ("TRACKING LOST", self.RECORDING_COLOR),
+            }[self.atlas_status]
+            cv2.putText(panel, atlas_text, (margin, 58),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, atlas_color, 2, cv2.LINE_AA)
 
         if len(self.times) >= 2:
             t0, t1 = self.times[0], self.times[-1]
@@ -1564,6 +1588,13 @@ def main() -> int:
             orb_last_print = [0.0]  # mutable box, see _on_orb_pose
             orb_last_map_epoch: list[int | None] = [None]  # mutable box, see _on_orb_pose
             orb_map_resets = [0]  # mutable box, see _on_orb_pose
+            # The map id ORB-SLAM3 cold-started into for the current epoch --
+            # see _on_orb_pose's atlas-status block for why a merge is
+            # detected as "this changed while map_epoch did not". Must be
+            # bound before _on_orb_pose is DEFINED, not merely before it
+            # runs: it is passed as a default argument, like every other
+            # per-episode box here, and defaults evaluate at definition time.
+            orb_session_map_id: list[int | None] = [None]
 
             def _on_orb_pose(
                 ts: float,
@@ -1573,6 +1604,10 @@ def main() -> int:
                 last_print: list[float] = orb_last_print,
                 last_map_epoch: list[int | None] = orb_last_map_epoch,
                 map_resets: list[int] = orb_map_resets,
+                mon: Any = monitor,
+                orb: OrbSlamTracker | None = orb_tracker,
+                session_map: list[int | None] = orb_session_map_id,
+                using_atlas: bool = args.orbslam_map_dir is not None,
             ) -> None:
                 # Runs on OrbSlamWorker's own thread, not the capture thread
                 # -- see that class's docstring. trajectory/last_print/
@@ -1618,6 +1653,26 @@ def main() -> int:
                         {"timestamp": ts, "x": 0.0, "y": 0.0, "z": 0.0, "q_x": 0.0, "q_y": 0.0, "q_z": 0.0, "q_w": 1.0,
                          "is_lost": 1, "map_epoch": map_epoch}
                     )
+
+                # Atlas relocalization status for the monitor -- only
+                # meaningful with a map loaded, so left untouched otherwise.
+                #
+                # A MERGE is "the active map changed while map_epoch did
+                # NOT", which is exactly the pair of facts that distinguishes
+                # it from a reset: a reset creates a new map too (so the id
+                # also changes) but bumps the epoch, while ChangeMap on merge
+                # leaves the epoch alone. Tracking each session map against
+                # the epoch it belongs to means a reset re-arms the indicator
+                # rather than falsely latching it green forever.
+                if using_atlas and orb is not None and mon is not None:
+                    map_id = orb.current_map_id
+                    if session_map[0] is None or map_epoch != last_map_epoch[0]:
+                        session_map[0] = map_id   # this epoch's own cold-started map
+                        mon.atlas_status = "localizing"
+                    elif map_id != session_map[0]:
+                        mon.atlas_status = "merged"
+                    if pose is None and mon.atlas_status != "merged":
+                        mon.atlas_status = "lost"
 
             orb_worker = (
                 OrbSlamWorker(orb_tracker, _on_orb_pose, gripper_masks=gripper_masks)
