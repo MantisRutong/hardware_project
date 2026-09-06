@@ -174,15 +174,31 @@ python3 output_script/replay_slam.py recording --map-dir maps/workspace
 python3 output_script/export_dataset.py recording --output dataset.zarr
 ```
 
-Measured on scan_0011 -- the same recording taken both ways, exported both ways:
+Measured on scan_0011 -- the same recording taken both ways. Replay is NOT
+deterministic (local mapping and loop closing run on their own threads, so their
+interleaving with tracking differs every run), so the replay row is seven runs of the
+same command on the same bytes:
 
-| | tracked poses | exported frames | episodes | speed splits |
-|---|---|---|---|---|
-| live | 582 | 581 | 4 | 3 |
-| replay | 1614 | 1557 | 1 | 0 |
+| | tracked poses | exported frames | episodes | speed splits | usable H=16 windows |
+|---|---|---|---|---|---|
+| live | 582 | 581 | 4 | 3 | 521 |
+| replay, median | 1526 | 1541 | 5 | 2 | 1477 |
+| replay, range | 1490-1614 | 1525-1557 | 1-6 | 0-4 | 1462-1542 |
 
-2.7x the frames and 3.0x the usable 16-frame training windows, from bytes that were
-already on disk. The reasons are structural rather than incidental:
+The headline counts swing a lot between runs -- one run came out as a single episode
+with zero splits, another as six episodes with three -- but the number that actually
+matters barely moves: usable training windows span 1462-1542, a 5% spread, because the
+splits mostly land near the ends of the trajectory. Every run, including the worst, is
+about 2.8x live.
+
+So do not treat a non-zero split count in a replay as a failed run to be repeated. The
+split is the mechanism working; re-running to chase zero buys around 5% and costs a
+selection process. What the count IS good for is comparing the refined trajectory
+against the same run's live-equivalent (replay_slam.py prints both, as `jumps a -> b`):
+b should be well below a, which is what says refinement did its job on that run.
+
+The gain over live comes from bytes that were already on disk, and its reasons are
+structural rather than incidental:
 
 - **Rate.** Live tracking shares the machine with the capture thread and is pinned to
   10Hz (`OrbSlamWorker.min_interval` -- 20Hz reproduced a crash), against a camera
