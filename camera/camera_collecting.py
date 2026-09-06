@@ -610,6 +610,11 @@ class RealSenseCapture:
             "ended_at": capture_ended_at_wall,
             "processing_ended_at": processing_ended_at_wall,
             "complete": complete,
+            # Distinct from `complete`, which is also false for a capture
+            # that simply saved nothing. Callers running a BATCH need to
+            # tell those apart: Ctrl+C means stop everything, an empty
+            # capture does not.
+            "interrupted": interrupted,
             "max_duration_seconds": self.max_duration_seconds,
             "actual_capture_seconds": (
                 (capture_end_mono_ns - self.start_mono_ns) / 1e9

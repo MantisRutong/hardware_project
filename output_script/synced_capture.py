@@ -1865,7 +1865,17 @@ def main() -> int:
                 event.set()
 
             threading.Thread(target=_wait_for_terminal_enter, daemon=True).start()
-            start_event.wait()
+            try:
+                start_event.wait()
+            except KeyboardInterrupt:
+                # The other place Ctrl+C can land: waiting to START an
+                # episode, rather than inside capture() which catches it
+                # itself. Nothing has been recorded yet, so just stop --
+                # quietly, since a traceback here would say nothing a user
+                # who pressed Ctrl+C does not already know. The outer
+                # finally still closes the monitor and the servo poller.
+                print("\nCtrl+C -- stopping.")
+                abort_batch_event.set()
 
             if abort_batch_event.is_set():
                 print("Batch stopped before this episode started recording.")
@@ -1879,6 +1889,18 @@ def main() -> int:
             threading.Thread(target=_wait_for_stop, daemon=True).start()
 
             capture_result = capture.capture()
+            if capture_result.get("interrupted"):
+                # RealSenseCapture catches KeyboardInterrupt itself, so that
+                # this episode's frames still get written instead of dying
+                # mid-drain -- but it then returns normally, and without this
+                # the batch loop would just start the next episode and wait
+                # for Enter again. From the terminal that looks exactly like
+                # Ctrl+C did nothing.
+                #
+                # This episode is still finished and written out below; only
+                # the ones after it are dropped.
+                print("Ctrl+C -- finishing this episode, then stopping the batch.")
+                abort_batch_event.set()
 
             # Drain OrbSlamWorker before reading orb_trajectory below: it
             # runs on its own thread (see that class's docstring), so the
