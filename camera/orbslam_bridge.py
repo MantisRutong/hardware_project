@@ -76,6 +76,11 @@ class OrbSlamTracker:
         self._lib.orb_track_stereo.restype = ctypes.c_int
         self._lib.orb_shutdown.argtypes = [ctypes.c_void_p]
         self._lib.orb_shutdown.restype = None
+        for _name, _restype in (("orb_get_current_map_kf_count", ctypes.c_long),
+                                 ("orb_current_map_imu_initialized", ctypes.c_int),
+                                 ("orb_current_map_imu_ba2", ctypes.c_int)):
+            getattr(self._lib, _name).argtypes = [ctypes.c_void_p]
+            getattr(self._lib, _name).restype = _restype
         self._lib.orb_get_current_map_id.argtypes = [ctypes.c_void_p]
         self._lib.orb_get_current_map_id.restype = ctypes.c_long
         self._lib.orb_save_trajectory_tum.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -165,6 +170,29 @@ class OrbSlamTracker:
         if not self._handle:
             return 0
         return int(self._lib.orb_get_current_map_id(self._handle))
+
+    @property
+    def place_recognition_gates(self) -> dict:
+        """The three conditions LoopClosing::NewDetectCommonRegions returns
+        early on, before it will look for a place it recognises.
+
+        Place recognition is the only route into a loaded atlas, so when
+        current_map_id never changes these say which gate is holding it
+        shut:
+
+            imu_ba2 False        -> gate 1, the map has not finished IMU BA2
+            keyframes < 5 or 12  -> gates 2 and 3, the map is too small
+
+        All three are about the CURRENT map -- the one this session
+        cold-started -- never the loaded atlas. Diagnostic only; nothing in
+        the pipeline branches on it."""
+        if not self._handle:
+            return {"keyframes": 0, "imu_initialized": False, "imu_ba2": False}
+        return {
+            "keyframes": int(self._lib.orb_get_current_map_kf_count(self._handle)),
+            "imu_initialized": bool(self._lib.orb_current_map_imu_initialized(self._handle)),
+            "imu_ba2": bool(self._lib.orb_current_map_imu_ba2(self._handle)),
+        }
 
     def shutdown(self) -> None:
         """Stops ORB-SLAM3's internal threads. Call before save_trajectory_tum.

@@ -170,11 +170,24 @@ def main() -> int:
     last_print = [0.0]
     tracked_count = [0]
     total_count = [0]
+    # Resets during the mapping pass matter more than they look. Every reset
+    # DISCARDS the map built so far and starts another (Tracking::
+    # ResetActiveMap), so the atlas that gets saved covers only what was swept
+    # AFTER the last one -- not the whole session, however long it ran. A
+    # mapping pass that reset at 50s of a 60s sweep saves 10 seconds of
+    # workspace and still prints a healthy-looking tracked ratio.
+    map_resets = [0]
+    last_epoch: list[int | None] = [None]
 
     def _on_pose(ts: float, pose: tuple | None, map_epoch: int) -> None:
         total_count[0] += 1
         if pose is not None:
             tracked_count[0] += 1
+        if last_epoch[0] is not None and map_epoch != last_epoch[0]:
+            map_resets[0] += 1
+            print(f"\n[mapping] WARNING: reset (map_epoch {last_epoch[0]} -> {map_epoch}) -- everything "
+                  f"swept before this point has been discarded and is NOT in the atlas.")
+        last_epoch[0] = map_epoch
         now = time.monotonic()
         if now - last_print[0] >= 1.0:
             last_print[0] = now
@@ -241,6 +254,25 @@ def main() -> int:
         worker.close()
         capture.stop_camera()
         print(f"\n\n{tracked_count[0]}/{total_count[0]} frames tracked during mapping.")
+
+        # Read BEFORE shutdown, while the map is still live. This is the map
+        # about to be written, so these are the atlas's own properties, not a
+        # proxy for them.
+        #
+        # Why these three: a saved .osa can be large, look fine, and still be
+        # useless to localize against, and nothing downstream will say so --
+        # a demo that fails to relocalize just silently cold-starts instead
+        # (see replay_slam.py's "atlas merge NEVER"). The checks are the
+        # conditions that actually gate its use later:
+        #
+        #  - imu_ba2: Map::serialize writes mbIMU_BA2, and
+        #    LocalMapping.cc's "Not enough motion for initializing" reset is
+        #    gated on !GetIniertialBA2(). An atlas saved with it false cannot
+        #    give a later session that bypass.
+        #  - keyframes: LoopClosing::NewDetectCommonRegions refuses to even
+        #    look for a recognisable place in a map with fewer than 12.
+        #  - resets: each one discarded everything mapped before it.
+        gates = tracker.place_recognition_gates
         print("Shutting down ORB-SLAM3 (this triggers the atlas save)...")
         tracker.shutdown()
         tracker.close()
@@ -248,7 +280,31 @@ def main() -> int:
     atlas_path = output_dir / "atlas.osa"
     if atlas_path.is_file():
         size_mb = atlas_path.stat().st_size / 1e6
-        print(f"Wrote {atlas_path} ({size_mb:.1f} MB)")
+        print(f"\nWrote {atlas_path} ({size_mb:.1f} MB)")
+        print(f"  keyframes          {gates['keyframes']}")
+        print(f"  IMU initialized    {gates['imu_initialized']}")
+        print(f"  IMU BA2 complete   {gates['imu_ba2']}")
+        print(f"  resets during pass {map_resets[0]}")
+
+        problems = []
+        if not gates["imu_ba2"]:
+            problems.append("IMU BA2 never completed -- a session loading this atlas gets no bypass of the "
+                            "2cm init gate, which is the main reason to build one. Sweep with larger, "
+                            "sustained TRANSLATION (20-30cm, not rotation in place) for longer.")
+        if gates["keyframes"] < 12:
+            problems.append(f"only {gates['keyframes']} keyframes -- LoopClosing refuses to attempt place "
+                            f"recognition below 12, so nothing can ever relocalize into this.")
+        if map_resets[0]:
+            problems.append(f"{map_resets[0]} reset(s) during the pass -- the atlas covers only what was swept "
+                            f"after the last one, not the whole session.")
+        if problems:
+            print("\nThis atlas is probably NOT usable:")
+            for pr in problems:
+                print(f"  - {pr}")
+        else:
+            print("\nLooks usable. Confirm it by recording a short clip in the SAME scene and checking that")
+            print("replay_slam.py --map-dir reports an 'atlas merge +Ns' rather than 'NEVER' -- these numbers")
+            print("say the atlas is well-formed, only a relocalization test says the scene is recognisable.")
         return 0
     print(f"WARNING: expected {atlas_path} but it wasn't created -- check the ORB-SLAM3 console output above "
           f"for errors, and confirm {settings_path} has System.SaveAtlasToFile set.")
