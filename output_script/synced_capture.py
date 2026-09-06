@@ -1594,7 +1594,7 @@ def main() -> int:
             # bound before _on_orb_pose is DEFINED, not merely before it
             # runs: it is passed as a default argument, like every other
             # per-episode box here, and defaults evaluate at definition time.
-            orb_session_map_id: list[int | None] = [None]
+            orb_session_map_id: list[tuple[int, int, bool] | None] = [None]
 
             def _on_orb_pose(
                 ts: float,
@@ -1606,7 +1606,7 @@ def main() -> int:
                 map_resets: list[int] = orb_map_resets,
                 mon: Any = monitor,
                 orb: OrbSlamTracker | None = orb_tracker,
-                session_map: list[int | None] = orb_session_map_id,
+                session_map: list[tuple[int, int, bool] | None] = orb_session_map_id,
                 using_atlas: bool = args.orbslam_map_dir is not None,
             ) -> None:
                 # Runs on OrbSlamWorker's own thread, not the capture thread
@@ -1665,14 +1665,27 @@ def main() -> int:
                 # the epoch it belongs to means a reset re-arms the indicator
                 # rather than falsely latching it green forever.
                 if using_atlas and orb is not None and mon is not None:
+                    # State is kept as (epoch, session map id, merged) in one
+                    # box, and the status is recomputed from it on EVERY
+                    # call. Two bugs came from not doing that: the epoch was
+                    # compared against last_map_epoch[0] after the line above
+                    # had already overwritten it (so a reset never re-armed
+                    # the indicator), and the status was only assigned inside
+                    # the branches, so the first few frames before the map
+                    # initializes set "lost" and nothing ever set it back --
+                    # it stayed red for the rest of the episode no matter
+                    # what tracking did.
                     map_id = orb.current_map_id
-                    if session_map[0] is None or map_epoch != last_map_epoch[0]:
-                        session_map[0] = map_id   # this epoch's own cold-started map
-                        mon.atlas_status = "localizing"
-                    elif map_id != session_map[0]:
-                        mon.atlas_status = "merged"
-                    if pose is None and mon.atlas_status != "merged":
-                        mon.atlas_status = "lost"
+                    prev = session_map[0]
+                    if prev is None or prev[0] != map_epoch:
+                        # New epoch: a reset just created another map for
+                        # this session, so the merge has to happen again.
+                        session_map[0] = (map_epoch, map_id, False)
+                    elif not prev[2] and map_id != prev[1]:
+                        # Same epoch, different map -- ChangeMap, i.e. merged.
+                        session_map[0] = (prev[0], prev[1], True)
+                    mon.atlas_status = ("merged" if session_map[0][2]
+                                        else "lost" if pose is None else "localizing")
 
             orb_worker = (
                 OrbSlamWorker(orb_tracker, _on_orb_pose, gripper_masks=gripper_masks)
