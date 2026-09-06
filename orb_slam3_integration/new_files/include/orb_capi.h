@@ -76,6 +76,22 @@ void orb_feed_imu(void *handle, double timestamp, double gx, double gy, double g
 int orb_track_stereo(void *handle, double timestamp, int width, int height, const unsigned char *left_gray,
                       const unsigned char *right_gray, double *out_xyz3, double *out_quat_xyzw4, long *out_map_epoch);
 
+// The id of the map tracking is currently in
+// (ORB_SLAM3::System::GetCurrentMapId -- see its doc comment in System.h).
+//
+// What this is for: with an atlas loaded, "tracking is OK" does NOT mean
+// "localized in that atlas". LoadAtlas restores the saved map (id 0) but the
+// session then cold-starts its OWN map ("Creation of new map with id: 1")
+// and tracks there, which is precisely the cold start the atlas exists to
+// avoid, until LoopClosing recognises the region and merges -- at which
+// point Atlas::ChangeMap switches the active map and this id becomes the
+// atlas's. So a caller wanting to know "am I in the atlas yet" watches this,
+// not the tracking state and not out_map_epoch (a merge is not a reset, so
+// the epoch counter never moves for it).
+//
+// 0 if handle is NULL. Cheap enough to call per frame.
+long orb_get_current_map_id(void *handle);
+
 // Stops all ORB-SLAM3 threads (local mapping, loop closing). Must be called
 // before orb_save_trajectory_tum. Safe to call more than once (a no-op after
 // the first call) and safe to skip calling directly - orb_destroy calls it

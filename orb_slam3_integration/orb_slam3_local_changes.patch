@@ -131,10 +131,10 @@ index e1e2717..8076d76 100644
      bool mHasViewer;
  
 diff --git a/include/System.h b/include/System.h
-index 872c86e..26c9b2b 100644
+index 872c86e..4dee255 100644
 --- a/include/System.h
 +++ b/include/System.h
-@@ -177,6 +177,23 @@ public:
+@@ -177,6 +177,43 @@ public:
      std::vector<MapPoint*> GetTrackedMapPoints();
      std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
  
@@ -154,6 +154,26 @@ index 872c86e..26c9b2b 100644
 +    // even though the origin does -- see Atlas.h's doc comment for the
 +    // full story.
 +    long unsigned int GetMapEpoch();
++
++    // Local addition (not upstream): the ACTIVE map's own id
++    // (Atlas::GetCurrentMap()->GetId()), which is the complement of
++    // GetMapEpoch() above rather than a substitute for it.
++    //
++    // GetMapEpoch() answers "did the origin move because of a RESET". This
++    // answers "which map am I in", and the case it exists for is the one
++    // GetMapEpoch() structurally cannot see: a MERGE. Loading an atlas does
++    // not put tracking into it -- the session cold-starts its own new map
++    // (visible as "Creation of new map with id: 1" after LoadAtlas) and
++    // tracks there until LoopClosing recognises the region and merges,
++    // at which point Atlas::ChangeMap() switches the active map to the
++    // atlas's. Neither touches the reset counter, so this id changing is
++    // the only in-process evidence that a merge happened.
++    //
++    // The practical use is live: "tracking is OK" does not mean "localized
++    // in the loaded atlas" -- it is equally true of the cold-started map,
++    // which is exactly the situation the atlas exists to avoid. Comparing
++    // this against the id the atlas loaded with distinguishes the two.
++    long unsigned int GetCurrentMapId();
 +
      // For debugging
      double GetTimeFromIMUInit();
@@ -184,6 +204,97 @@ index 7bdea06..c413415 100644
  }
  
  void Atlas::clearAtlas()
+diff --git a/src/Optimizer.cc b/src/Optimizer.cc
+index b785be3..9f16283 100644
+--- a/src/Optimizer.cc
++++ b/src/Optimizer.cc
+@@ -2392,7 +2392,8 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
+         opt_it=4;
+     }
+     const int Nd = std::min((int)pCurrentMap->KeyFramesInMap()-2,maxOpt);
+-    const unsigned long maxKFid = pKF->mnId;
++    // maxKFid is computed further down, once the keyframe lists exist -- same
++    // vertex-id collision as MergeInertialBA, see the comment there.
+ 
+     vector<KeyFrame*> vpOptimizableKFs;
+     const vector<KeyFrame*> vpNeighsKFs = pKF->GetVectorCovisibleKeyFrames();
+@@ -2524,6 +2525,25 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
+     }
+ 
+ 
++    // Local change (not upstream): the largest keyframe id in this
++    // optimization, not pKF's own -- see MergeInertialBA for the full
++    // explanation of the packed vertex-id layout and what goes wrong.
++    //
++    // This one matters more often than the merge case: LocalInertialBA runs
++    // on essentially every keyframe (LocalMapping::Run), not just when two
++    // maps join. Cold-starting a map makes ids ascend with pKF, so upstream's
++    // value happens to be the maximum and nothing collides -- which is why
++    // this never showed up before loading an atlas. Once a saved map is
++    // loaded, its keyframe ids and this session's interleave and pKF is
++    // routinely not the newest.
++    unsigned long maxKFid = pKF->mnId;
++    for(KeyFrame* pKFi : vpOptimizableKFs)
++        if(pKFi && pKFi->mnId > maxKFid) maxKFid = pKFi->mnId;
++    for(KeyFrame* pKFi : lpOptVisKFs)
++        if(pKFi && pKFi->mnId > maxKFid) maxKFid = pKFi->mnId;
++    for(KeyFrame* pKFi : lFixedKeyFrames)
++        if(pKFi && pKFi->mnId > maxKFid) maxKFid = pKFi->mnId;
++
+     // Set Local temporal KeyFrame vertices
+     N=vpOptimizableKFs.size();
+     for(int i=0; i<N; i++)
+@@ -3948,7 +3968,9 @@ void Optimizer::LocalBundleAdjustment(KeyFrame* pMainKF,vector<KeyFrame*> vpAdju
+ void Optimizer::MergeInertialBA(KeyFrame* pCurrKF, KeyFrame* pMergeKF, bool *pbStopFlag, Map *pMap, LoopClosing::KeyFrameAndPose &corrPoses)
+ {
+     const int Nd = 6;
+-    const unsigned long maxKFid = pCurrKF->mnId;
++    // maxKFid is computed further down, once the keyframe lists exist -- see
++    // the comment there. Upstream sets it to pCurrKF->mnId right here, which
++    // is not the maximum and collides vertex ids.
+ 
+     vector<KeyFrame*> vpOptimizableKFs;
+     vpOptimizableKFs.reserve(2*Nd);
+@@ -4100,6 +4122,39 @@ void Optimizer::MergeInertialBA(KeyFrame* pCurrKF, KeyFrame* pMergeKF, bool *pbS
+     optimizer.setAlgorithm(solver);
+     optimizer.setVerbose(false);
+ 
++    // Local change (not upstream): maxKFid must be the LARGEST keyframe id
++    // taking part in this optimization, because the vertex-id layout below
++    // is packed against it:
++    //
++    //     pose vertex          id = pKFi->mnId
++    //     velocity/bias        id = maxKFid + 3*pKFi->mnId + {1,2,3}
++    //     map point            id = maxKFid*5 + pMP->mnId + 1
++    //
++    // The pose block only stays below the IMU block while every id is <=
++    // maxKFid. Upstream initialises it to pCurrKF->mnId -- the CURRENT
++    // keyframe, not the maximum -- so any keyframe with a higher id lands its
++    // pose vertex inside the IMU range, and g2o rejects the duplicate:
++    // "addVertex: FATAL, a vertex with ID N has already been registered".
++    // Rejected vertices are silently left out of the graph, and edges then
++    // resolve that id to whichever vertex got there first -- of the wrong
++    // type.
++    //
++    // Merging a loaded atlas is what exposes this here. The two maps' ids
++    // come from different sessions and interleave, so the "current" keyframe
++    // is routinely not the newest. Observed live as 20 rejected vertices in
++    // two clusters (438-442 and 1757-1771) during a single merge.
++    //
++    // Computing it properly also retires the `if (pKFi->mnId > maxKFid)
++    // continue;` guard in the observation loop below, which exists only to
++    // paper over this overflow and drops otherwise-valid observations.
++    unsigned long maxKFid = pCurrKF->mnId;
++    for(KeyFrame* pKFi : vpOptimizableKFs)
++        if(pKFi && pKFi->mnId > maxKFid) maxKFid = pKFi->mnId;
++    for(KeyFrame* pKFi : vpOptimizableCovKFs)
++        if(pKFi && pKFi->mnId > maxKFid) maxKFid = pKFi->mnId;
++    for(KeyFrame* pKFi : lFixedKeyFrames)
++        if(pKFi && pKFi->mnId > maxKFid) maxKFid = pKFi->mnId;
++
+     // Set Local KeyFrame vertices
+     N=vpOptimizableKFs.size();
+     for(int i=0; i<N; i++)
 diff --git a/src/Settings.cc b/src/Settings.cc
 index 93a50be..b26afad 100644
 --- a/src/Settings.cc
@@ -201,10 +312,82 @@ index 93a50be..b26afad 100644
              if(settings.cameraType_ == Settings::PinHole || settings.cameraType_ ==  Settings::Rectified){
                  output << "Pinhole";
 diff --git a/src/System.cc b/src/System.cc
-index 60d9c51..b696dbb 100644
+index 60d9c51..8572bea 100644
 --- a/src/System.cc
 +++ b/src/System.cc
-@@ -1324,6 +1324,14 @@ int System::GetTrackingState()
+@@ -21,6 +21,7 @@
+ #include "System.h"
+ #include "Converter.h"
+ #include <thread>
++#include <chrono>
+ #include <pangolin/pangolin.h>
+ #include <iomanip>
+ #include <openssl/md5.h>
+@@ -530,20 +531,50 @@ void System::Shutdown()
+             usleep(5000);
+     }*/
+ 
+-    // Wait until all thread have effectively stopped
+-    /*while(!mpLocalMapper->isFinished() || !mpLoopCloser->isFinished() || mpLoopCloser->isRunningGBA())
++    // Local change (not upstream): actually wait for the mapping and
++    // loop-closing threads to stop. Upstream requests them to finish and
++    // then returns immediately -- the wait that used to be here is the
++    // commented-out block this replaces.
++    //
++    // Everything after this point walks the atlas: SaveAtlas() below, and
++    // SaveTrajectoryTUM()/SaveKeyFrameTrajectory*(), which callers are told
++    // to invoke after Shutdown(). Without the wait, those run while
++    // LocalMapping is still inserting and culling keyframes and LoopClosing
++    // is still merging maps -- reading containers another thread is
++    // mutating. Neither thread is ever joined either (mptLocalMapping /
++    // mptLoopClosing are new'd and never deleted, and System has no
++    // destructor), so they can also outlive the objects they point into.
++    //
++    // Seen live on this project, three times before this change: heap
++    // corruption ("free(): corrupted unsorted chunks") immediately after an
++    // atlas save, and "FATAL: exception not rethrown" + SIGABRT at process
++    // exit after a recording. In every case the output file was already
++    // complete, which is exactly what a race that only bites during teardown
++    // looks like.
++    //
++    // Bounded rather than unconditional, because the reason to remove it is
++    // real: LoopClosing::isRunningGBA() can stay true for a long time on a
++    // large map, and hanging on shutdown would be a worse failure than an
++    // inconsistent save. On timeout, say so loudly and continue -- upstream's
++    // own commented-out version had the same "break anyway" escape.
+     {
+-        if(!mpLocalMapper->isFinished())
+-            cout << "mpLocalMapper is not finished" << endl;*/
+-        /*if(!mpLoopCloser->isFinished())
+-            cout << "mpLoopCloser is not finished" << endl;
+-        if(mpLoopCloser->isRunningGBA()){
+-            cout << "mpLoopCloser is running GBA" << endl;
+-            cout << "break anyway..." << endl;
+-            break;
+-        }*/
+-        /*usleep(5000);
+-    }*/
++        const std::chrono::steady_clock::time_point deadline =
++            std::chrono::steady_clock::now() + std::chrono::seconds(20);
++        while(!mpLocalMapper->isFinished() || !mpLoopCloser->isFinished() || mpLoopCloser->isRunningGBA())
++        {
++            if(std::chrono::steady_clock::now() > deadline)
++            {
++                cerr << "Shutdown: mapping/loop-closing threads still running after 20s"
++                     << " (LocalMapping finished=" << mpLocalMapper->isFinished()
++                     << ", LoopClosing finished=" << mpLoopCloser->isFinished()
++                     << ", GBA running=" << mpLoopCloser->isRunningGBA()
++                     << ") -- continuing anyway; anything saved below may be inconsistent."
++                     << endl;
++                break;
++            }
++            usleep(5000);
++        }
++    }
+ 
+     if(!mStrSaveAtlasToFile.empty())
+     {
+@@ -1324,6 +1355,23 @@ int System::GetTrackingState()
      return mTrackingState;
  }
  
@@ -214,6 +397,15 @@ index 60d9c51..b696dbb 100644
 +    // call any time, no separate locking needed here (see System.h's and
 +    // Atlas.h's comments on this).
 +    return mpAtlas->GetResetGeneration();
++}
++
++long unsigned int System::GetCurrentMapId()
++{
++    // Atlas::GetCurrentMap() takes Atlas's own mutex, and Map::GetId()
++    // returns a value fixed at construction -- no extra locking needed
++    // here, same as GetMapEpoch() above.
++    Map* pMap = mpAtlas->GetCurrentMap();
++    return pMap ? pMap->GetId() : 0;
 +}
 +
  vector<MapPoint*> System::GetTrackedMapPoints()

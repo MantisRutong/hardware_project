@@ -73,6 +73,31 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
   - `include/Atlas.h` / `src/Atlas.cc`: the actual counter (`mnResetGeneration`),
     incremented inside both `CreateNewMap()` and `clearMap()` so it catches every reset
     path, backing `System::GetMapEpoch()` above.
+  - `src/Optimizer.cc`: fixes vertex-id collisions in `LocalInertialBA()` and
+    `MergeInertialBA()`. Both pack three kinds of g2o vertex into one id space against
+    `maxKFid` (pose `= mnId`, velocity/bias `= maxKFid + 3*mnId + {1,2,3}`, map point
+    `= maxKFid*5 + mnId + 1`), but upstream sets `maxKFid` to the *current* keyframe's id
+    rather than the largest one in the optimization. Any keyframe above that lands its
+    pose vertex inside the IMU range, and g2o rejects the duplicate ("addVertex: FATAL, a
+    vertex with ID N has already been registered") -- rejected vertices are silently left
+    out of the graph and edges then resolve that id to a vertex of the wrong type. This
+    only shows up once an atlas is **loaded**: cold-started ids ascend with the current
+    keyframe, so upstream's value happens to be the maximum. A loaded map's ids and the
+    session's interleave. Observed live as 20 rejected vertices in two clusters during a
+    single merge. Computing `maxKFid` properly also retires the `if(pKFi->mnId > maxKFid)
+    continue;` guard in `MergeInertialBA`'s observation loop, which existed only to paper
+    over the overflow and dropped otherwise-valid observations.
+  - `src/System.cc`: `Shutdown()` now actually waits for the mapping and loop-closing
+    threads to stop (bounded at 20s, then says so loudly and continues). Upstream requests
+    them to finish and returns immediately -- the wait is present but commented out --
+    while everything after that point walks the atlas: `SaveAtlas()`, and the
+    `SaveTrajectoryTUM()` / `SaveKeyFrameTrajectory*()` calls that callers are told to make
+    *after* `Shutdown()`. Those were reading containers `LocalMapping` and `LoopClosing`
+    were still mutating; neither thread is ever joined either. Seen three times on this
+    project before the change: `free(): corrupted unsorted chunks` right after an atlas
+    save, and `FATAL: exception not rethrown` + `SIGABRT` at process exit after a
+    recording -- in every case the output file was already complete, which is what a
+    teardown-only race looks like.
   - `Examples/*.cc`: three example binaries had `bUseViewer` flipped `true`->`false`;
     unrelated to our tracking path (different dataset-replay examples), left over from
     getting the initial build working headless on this machine.
@@ -83,6 +108,10 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
   camera, instead of ORB-SLAM3 opening its own RealSense connection the way the stock
   `Examples/Stereo-Inertial/stereo_inertial_realsense_D435i.cc` example does. Mirrors
   `open_vins/ov_msckf/src/ov_capi.h`'s role for OpenVINS in this same project.
+  Besides per-frame tracking it exposes `orb_shutdown()` and
+  `orb_save_trajectory_tum()`, which is what makes the refined trajectory below
+  possible -- ORB-SLAM3 will only resolve frame poses against the final map after
+  its threads have stopped.
 - **`new_files/config/RealSense_D435i_ours.yaml`** -- Stereo-Inertial calibration
   measured live from this specific D435I unit (serial 346222071398) via
   `rs-enumerate-devices -c`, not assumed/borrowed. See the file's own header comment
@@ -97,14 +126,21 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
   override via `OrbSlamTracker(settings_path=..., vocab_path=..., lib_path=...)` or the
   matching `--orbslam-*` CLI flags on `output_script/synced_capture.py` if built
   elsewhere.
-- `output_script/synced_capture.py` -- `--orbslam`/`--no-orbslam` (default: **on**, the
-  primary live tracker) runs ORB-SLAM3 Stereo-Inertial tracking on its own thread
-  (`OrbSlamWorker`) alongside recording, writing live pose to `camera_trajectory.csv`
-  per episode (columns include `map_epoch` -- see its docstring on
-  `write_camera_trajectory_csv` for what a reset means for that file, and for
-  downstream training-data use). Also auto-enables stereo IR capture
-  (`camera/camera_collecting.py`'s `record_ir`) since Stereo-Inertial tracking needs
-  both IR streams, not just color.
+- `output_script/synced_capture.py` -- records. `--record-ir` (default **on**) saves the
+  left/right IR streams, which is what the tracking pass consumes, live or offline.
+  `--orbslam` (default **off**) additionally runs ORB-SLAM3 on its own thread
+  (`OrbSlamWorker`) during the recording, writing `camera_trajectory.csv` and, at episode
+  end, `camera_trajectory_refined.csv`. That is now a rig sanity check rather than the
+  source of training labels -- see **Recording and tracking are separate steps** below.
+- `output_script/replay_slam.py` -- re-runs ORB-SLAM3 over an ALREADY-RECORDED episode
+  from its saved IR frames and IMU, instead of tracking while recording. The recordings
+  keep everything needed for this on purpose (raw unmasked IR PNGs, both index files, the
+  IMU CSVs), so a recording can be re-tracked against an atlas that did not exist when it
+  was made, at full frame rate rather than the live 10Hz throttle, with the gripper mask
+  as a clean A/B on identical input. On scan_0011 against `maps/workspace`: 1614 tracked
+  poses vs the live run's 582, exported as one episode with zero speed splits instead of
+  four episodes with three. Only for the data-collection branch -- teleoperation drives
+  the arm from the live pose and has nothing to be offline about.
 - `output_script/build_atlas_map.py` + `synced_capture.py --orbslam-map-dir` -- the
   two-stage approach: build a persistent map ONCE from a deliberate mapping pass, then
   LOCALIZE every demo against it rather than cold-starting a fresh map per episode.
@@ -121,6 +157,204 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
 
 Run `output_script/synced_capture.py --help` for the full flag list, or see this
 directory's patch/new-file comments for anything not covered above.
+
+## Recording and tracking are separate steps
+
+For data collection, `synced_capture.py` records and `replay_slam.py` tracks, afterwards.
+Live tracking (`--orbslam`) defaults to OFF.
+
+```bash
+# 1. record. --orbslam runs live tracking purely for the readiness indicator
+#    (see below) -- its trajectory is not what gets trained on.
+#    Per episode: warm up until the indicator turns green, press 'm', do the
+#    task, press Enter.
+python3 output_script/synced_capture.py --episodes 10 --orbslam
+
+# 2. track, offline, at full rate
+python3 output_script/replay_slam.py recording
+
+# 3. export -- warm-up is dropped at each episode's 'm' mark
+python3 output_script/export_dataset.py recording --output dataset.zarr
+```
+
+No `--map-dir`: the atlas does not currently do anything (see **Two-stage mapping**).
+Verified end to end on scan_0014 -- a real pick-and-place -- on 2026-09-06: 1873/1905
+tracked with zero resets, 1370 warm-up frames dropped, 535 frames exported as one episode
+with no coordinate-frame splits and a largest step of 2.0cm.
+
+Measured on scan_0011 -- the same recording taken both ways. Replay is NOT
+deterministic (local mapping and loop closing run on their own threads, so their
+interleaving with tracking differs every run), so the replay row is seven runs of the
+same command on the same bytes:
+
+| | tracked poses | exported frames | episodes | speed splits | usable H=16 windows |
+|---|---|---|---|---|---|
+| live | 582 | 581 | 4 | 3 | 521 |
+| replay, median | 1526 | 1541 | 5 | 2 | 1477 |
+| replay, range | 1490-1614 | 1525-1557 | 1-6 | 0-4 | 1462-1542 |
+
+The headline counts swing a lot between runs -- one run came out as a single episode
+with zero splits, another as six episodes with three -- but the number that actually
+matters barely moves: usable training windows span 1462-1542, a 5% spread, because the
+splits mostly land near the ends of the trajectory. Every run, including the worst, is
+about 2.8x live.
+
+So do not treat a non-zero split count in a replay as a failed run to be repeated. The
+split is the mechanism working; re-running to chase zero buys around 5% and costs a
+selection process. What the count IS good for is comparing the refined trajectory
+against the same run's live-equivalent (replay_slam.py prints both, as `jumps a -> b`):
+b should be well below a, which is what says refinement did its job on that run.
+
+The gain over live comes from bytes that were already on disk, and its reasons are
+structural rather than incidental:
+
+- **Rate.** Live tracking shares the machine with the capture thread and is pinned to
+  10Hz (`OrbSlamWorker.min_interval` -- 20Hz reproduced a crash), against a camera
+  recording at 30fps. `export_dataset.py` is pose-driven, so the other two thirds of the
+  frames are simply dropped. Offline there is no capture thread to starve.
+- **One attempt.** A live recording is tracked once, with whatever atlas, mask and
+  settings existed that day, and the result is final. Offline it can be re-tracked when
+  any of those improve.
+- **Experiments.** `--gripper-mask` against `--no-gripper-mask` live means two
+  recordings, which differ in how the operator moved as well as in the mask. Offline it
+  is the same bytes twice.
+
+What is given up: live tracking told you during the recording whether tracking was
+working. Offline you find out afterwards. `--orbslam` is still there for exactly that --
+run one episode with it before recording a batch -- but its output is a check, not a
+label.
+
+Teleoperation is unaffected and always tracks live: `umi_teleop.py` drives the arm from
+the pose, and a pose that arrives after the fact is no use to it.
+
+Two things follow from the default. Recordings must keep their IR (`--record-ir`, on by
+default) or they can never be re-tracked. And an episode recorded this way has no
+`camera_trajectory.csv` at all -- only the `camera_trajectory_refined.csv` that
+`replay_slam.py` writes -- which is why `export_dataset.py` accepts either
+(`has_trajectory`).
+
+### Marking where the demonstration starts
+
+A recording opens with warm-up: deliberate sweeping so ORB-SLAM3 can relocalize into the
+loaded atlas. Those frames must be **recorded** -- `replay_slam.py` has nothing else to
+relocalize from -- and must not be **trained on**. Measured on scan_0011: the first grasp
+is at t=46s of a 61.5s recording, and before it the camera sweeps 25-46cm per 5s window
+with the gripper sitting at 80.0mm (wide open) throughout. Exported unmarked, about two
+thirds of that episode teaches the policy to sweep with an open gripper -- and it passes
+every check in the exporter, because those frames really are well tracked, well synced
+and correctly labelled. They are simply not the demonstration.
+
+Press **`m`** in the monitor window when the demo itself begins:
+
+```
+Enter/Space   start recording
+              (warm-up: translate 20-30cm across the workspace)
+m             mark: the demonstration starts here
+              (the task)
+Enter/Space   stop
+```
+
+The border turns green and the window shows `DEMO +40.2s`, so a press that missed is
+obvious. Pressing again overwrites, so marking too early is fixed by marking again. The
+timestamp lands in `metadata.json` as `demo_start_host_ns` (host clock, the same one
+every stream is stamped with, so no conversion is needed to compare it with
+`frames.csv`), and `export_dataset.py` drops everything before it -- before segmenting,
+so reported segments are the ones actually exported.
+
+Unmarked episodes export in full, as they always did, but the exporter now says so on
+stderr rather than letting it pass silently. `--ignore-demo-start` reproduces the old
+behaviour.
+
+Nothing infers this boundary, deliberately. The tempting heuristic -- first gripper
+closure -- is wrong: approaching an object with the gripper open is part of the
+demonstration, and some tasks start already holding something. The reference UMI pipeline
+does not guess either; its `06_generate_dataset_plan.py` filters on a `check_result.txt`
+a human wrote after watching the video. This is the same judgement, moved to the moment
+it is obvious.
+
+`demo_start_offset_s` is also worth watching on its own: it is the warm-up cost. UMI's
+own demos need no warm-up, because the mapping pass is a separate video and each demo
+relocalizes immediately against a map of a well-textured scene. If the workspace texture
+does its job, this number should fall from ~40s toward a few seconds -- which makes it a
+direct measure of whether there is enough of it.
+
+### Knowing, during a recording, when it is safe to start the demo
+
+`--orbslam` (off by default) shows a readiness indicator in the monitor window:
+
+```
+READY -- initialized, safe to press 'm'    green
+READY + merged into atlas                  green   (with --orbslam-map-dir)
+warming up... keep translating 20-30cm     amber
+TRACKING LOST                              red
+```
+
+Green means the map has completed **IMU BA2**, which is what actually gates starting the
+demonstration: `LocalMapping`'s "Not enough motion for initializing" reset is guarded by
+`!GetIniertialBA2()`, so once the flag is set that reset stops applying for the rest of
+the recording and small careful motion becomes safe. "Tracking is OK" is true long
+before this, which is why it is not the signal to watch. On scan_0013 the flag was set
+about 20s in (`start VIBA 2` / `end VIBA 2` in the log).
+
+Note the window border is red while recording and green once `m` has been pressed --
+that is the recording/demo indicator, unrelated to this line, which lives in the plot
+panel under the `* RECORDING` status.
+
+The atlas half of the indicator exists because "tracking is OK" does **not** mean
+"localized in the atlas". `LoadAtlas`
+restores the saved map, but the session then cold-starts its **own** map -- visible in the
+log as `Creation of new map with id: 1` right after the load -- and tracks in that, which
+is precisely the cold start the atlas exists to avoid. Only when `LoopClosing` recognises
+the region does `Atlas::ChangeMap` switch the active map to the atlas's. Tracking looks
+healthy throughout.
+
+`map_epoch` cannot show this (a merge is not a reset, so the counter never moves), so
+`System::GetCurrentMapId()` and `orb_get_current_map_id()` were added to expose the active
+map's id. A merge is detected as **the map id changing while `map_epoch` does not** -- a
+reset also changes the id, but bumps the epoch, so tracking each session map against its
+epoch means a reset re-arms the indicator rather than latching it green.
+
+**What it found immediately: on scan_0011, the merge never happens.** Replaying the whole
+episode against `maps/workspace`, the map id goes 1 → 2 and only ever alongside a
+`map_epoch` change, i.e. resets. It never reaches the atlas's own map:
+
+```
+t=+ 0.00s  map_id 1 -> 1   map_epoch None -> 1   RESET
+t=+ 2.70s  map_id 1 -> 1   map_epoch 1 -> 2      RESET
+t=+55.74s  map_id 1 -> 2   map_epoch 2 -> 3      RESET
+t=+59.48s  map_id 2 -> 2   map_epoch 3 -> 4      RESET
+```
+
+Two things follow, and both contradict claims made earlier in this file:
+
+- **The IMU-init bypass does not apply.** The gate reads `mpCurrentKeyFrame->GetMap()
+  ->GetIniertialBA2()` (`LocalMapping.cc`) -- the *current* map. That is the freshly
+  created session map, whose `mbIMU_BA2` is false, not the loaded atlas's. Serializing
+  the flag only helps once tracking is actually IN the loaded map. scan_0011 still reset
+  three times, consistent with the gate being live.
+- **The mid-episode coordinate shifts are not merges.** With no merge occurring they must
+  come from loop closure or bundle adjustment inside the session's own map, which applies
+  the same kind of rigid correction with the same invisibility to `map_epoch`. Everything
+  built on top -- the refined trajectory, the speed split -- is unaffected, since none of
+  it depends on *which* mechanism moved the keyframes. Only the naming was wrong.
+
+So the two-stage atlas is, at present, loading a map and not using it. The 33% → 98%
+improvement between scan_0009 and scan_0011 has to be attributed to something else, most
+likely the "translate, don't rotate" operating change (scan_0010, also with the atlas, got
+53%). Why relocalization never fires is open -- unproven candidates include the loaded
+keyframes not entering the place-recognition database, and the scene simply not being
+recognisable enough.
+
+### Limits, measured
+
+Replaying does not rescue a recording whose scene was untrackable. scan_0006-0009 were
+recorded before the workspace texture went up, and today they export to literally
+nothing ("No usable frames survived processing" -- their longest continuous tracked run
+is 4 frames). Re-tracked against `maps/workspace` they reach 33-40% of frames and 139-243
+resets, yielding one usable segment each, up to 68 frames. Compare scan_0011, recorded
+after, in the scene the atlas actually covers: 98% and one reset. An atlas only helps
+where it recognises the scene, and no amount of offline processing recovers texture that
+was not in front of the camera.
 
 ## Two-stage mapping (build once, localize per demo)
 
@@ -143,13 +377,49 @@ python3 output_script/build_atlas_map.py --output-dir maps/kitchen_table
 python3 output_script/synced_capture.py --orbslam-map-dir maps/kitchen_table
 ```
 
-**Why loading a map actually removes the reset**, rather than just making it less likely:
-`Map.h`'s `serialize()` includes `mbImuInitialized` / `mbIsInertial` / `mbIMU_BA1` /
-`mbIMU_BA2` in what gets written to the `.osa`. A map built by a proper mapping pass
-saves with `GetIniertialBA2() == true`, and the reset above is gated specifically on
-`!GetIniertialBA2()` -- so a loaded, already-BA2-complete map never re-triggers it, no
-matter how small the demo's own motion is. The hard part (cold initialization) happens
-once, offline; each demo only does the easier part.
+**This does not currently work, and is not needed.** Both halves are measured below;
+read them before spending time on an atlas.
+
+The reasoning was: `Map.h`'s `serialize()` writes `mbIMU_BA2` into the `.osa`, a proper
+mapping pass saves with `GetIniertialBA2() == true`, and the reset above is gated on
+`!GetIniertialBA2()`, so a loaded already-BA2-complete map never re-triggers it. The
+step that reasoning skips is that **loading an atlas does not put tracking into it**.
+`LoadAtlas` restores the saved map, then the session cold-starts its own (`Creation of
+new map with id: 1` in the log) and tracks there until `LoopClosing` recognises the
+region and `Atlas::ChangeMap` switches over. The gate reads
+`mpCurrentKeyFrame->GetMap()->GetIniertialBA2()` -- the *current* map, which is the fresh
+one, whose flag is false. The bypass only ever applies after a merge.
+
+That merge has never been observed here. Across every recording replayed with
+`--map-dir`, `replay_slam.py` reports `atlas merge NEVER`, including against an atlas
+built in the same scene fourteen minutes before the recording. It is not the gates: the
+three conditions `LoopClosing::NewDetectCommonRegions` returns early on all open at 21.6s
+on scan_0013 and stay open, keyframes steady at 110-130, place recognition running for
+thirty further seconds without a single match. Why it never matches is unresolved.
+
+**What replaced it: earn the flag instead of loading it.** The warm-up at the start of
+each recording completes IMU BA2 in the session's own map -- visible in the log as
+`start VIBA 2` / `end VIBA 2`, about 20s in -- and from that point the gate stops
+applying for the rest of the recording, which is exactly what the atlas was supposed to
+provide. Measured on scan_0014, a real pick-and-place recorded this way:
+
+| | tracked | resets |
+|---|---|---|
+| scan_0006-0009, careful task, no warm-up | 33-35% | 66-100 |
+| scan_0014 warm-up segment (0-47s) | 99% | 1 |
+| **scan_0014 demo segment (47-66s)** | **92%** | **0** |
+
+Replayed offline the whole episode came out 1873/1905 tracked, zero resets, and exported
+to 535 frames in one episode with no coordinate-frame splits and a largest step of 2.0cm.
+So the pipeline works with no atlas at all, and `--orbslam-map-dir` is currently a no-op
+with extra load time.
+
+The one thing still missing without a working merge is a **world frame that survives
+across sessions**: ORB-SLAM3's yaw is set by wherever the camera pointed when the map
+initialized, so a camera-to-robot calibration is only valid for the session that produced
+it, and trajectories from different recordings cannot be expressed in one frame. That
+matters for rotation teleoperation and for combining recordings; it does not block
+collecting a dataset.
 
 Mechanics worth knowing before running either half:
 
@@ -165,6 +435,43 @@ Mechanics worth knowing before running either half:
   `System.LoadAtlasFromFile` is. Hence the two config variants,
   `config/RealSense_D435i_ours_mapping.yaml` and `..._relocalize.yaml` -- identical
   calibration to `..._ours.yaml`, plus that one key.
+
+### Refined trajectories
+
+Loading an atlas introduces a failure the live trajectory cannot flag. `map_epoch` catches
+every **reset**, but not a **merge**: when the session's own map is recognized as somewhere
+the loaded atlas already covers, `LoopClosing` rigidly transforms every keyframe and map
+point into the atlas's frame (`ApplyScaledRotation`) and switches the active map
+(`Atlas::ChangeMap`). Neither touches the reset counter, because both of its increment
+sites are reset paths. So the pose origin moves mid-episode with nothing marking it --
+observed live as a 38cm step between two consecutive 10Hz rows, `is_lost=0` and `map_epoch`
+unchanged on both sides. Every downstream sanity check calls that data healthy.
+
+ORB-SLAM3 already solves this for offline use, and the official UMI pipeline relies on it:
+`Tracking` stores each frame's pose *relative to its reference keyframe*
+(`mlRelativeFramePoses`), and `System::SaveTrajectoryTUM` resolves it at save time as
+`Trw * pKF->GetPose() * Two` using that keyframe's **final** pose. Merges and bundle
+adjustment move keyframes; the frame-to-keyframe relation survives, so every frame comes
+out in one frame -- the final map's -- with the merge discontinuity absorbed rather than
+recorded. After a merge that frame is the *atlas's* own, so refined trajectories from
+different episodes that both merged share one world frame.
+
+So each episode ends with `orb_shutdown()` (the wait added to `System::Shutdown()` above is
+what makes this safe), then `orb_save_trajectory_tum()` into
+`camera_trajectory_orbslam.tum`, which `write_refined_camera_trajectory_csv()`
+(`synced_capture.py`) joins back onto the live rows by timestamp to produce
+`camera_trajectory_refined.csv`. Frames the tracker ended up considering lost are written
+`is_lost=1`. `map_epoch` is carried over unchanged -- it still describes what happened
+during the run, and a refined file spanning a **reset** is still discontinuous (a reset
+destroys the keyframes, so there is nothing to re-resolve those frames against). Splitting
+on `map_epoch` stays correct; this only removes the discontinuities `map_epoch` could never
+see. The per-episode print reports the largest correction applied; anything above ~5cm
+means the live trajectory did contain a coordinate-frame shift.
+
+Note that the tracker is torn down and reconstructed per episode
+(`construct_orb_tracker()`), so this costs one atlas reload per demo rather than one per
+batch -- the price of getting a final map to resolve against while the batch is still
+running.
 
 ### Scene texture
 
@@ -191,18 +498,29 @@ Rearranging it means re-running `build_atlas_map.py`.
   10Hz (0.1s). This value was reached the hard way -- see the extensive comment above
   `OrbSlamWorker.__init__` in that file before changing it; a prior attempt at 20Hz
   reproduced a crash that took several rounds of live testing to root-cause and fix.
-- ORB-SLAM3 resets mid-recording are real and were observed live (not rare) --
-  `map_epoch` in `camera_trajectory.csv` flags them, but nothing downstream currently
-  *acts* on that (e.g. splitting an episode into per-segment trajectories for training).
-  The two-stage approach above is aimed squarely at removing the dominant cause of those
-  resets, so per-segment splitting may end up unnecessary -- but `map_epoch` is still the
-  thing to check to find out, and nothing consumes it yet either way.
-- **None of the two-stage path has been validated on hardware yet.** The mapping script,
-  the `--orbslam-map-dir` localize path, and the emitter change are all written and
-  compile, but no live run has confirmed that resets actually drop. The order to test in:
-  put the scene texture up, run `build_atlas_map.py` and watch its tracked/total ratio,
-  then record a demo with `--orbslam-map-dir` and compare reset counts against a
-  cold-start run.
+- ORB-SLAM3 resets mid-recording are real and were observed live (not rare). `map_epoch`
+  flags them and `output_script/export_dataset.py` now acts on it, splitting a recording
+  into one training episode per contiguous `map_epoch` segment rather than training across
+  a coordinate-frame teleport. The two-stage approach above is aimed squarely at removing
+  the dominant cause of those resets; if it works, most recordings should come out as a
+  single segment, and `map_epoch` is still the thing to check to find out.
+- **The two-stage path has now been tested on hardware, and it does not work.** Tracking
+  never merges into the loaded atlas, so none of the three things the atlas was for is
+  delivered -- see **Two-stage mapping** above for the measurements and the mechanism.
+  The reset problem it was built to solve is solved instead by the warm-up completing IMU
+  BA2 in the session's own map, which is verified (scan_0014: 92% tracked and zero resets
+  through the demonstration, against 33-35% and 66-100 resets without a warm-up). Leave
+  `--orbslam-map-dir` off. What is still unresolved is why place recognition never
+  matches; the gates are open and running, so the next step would be instrumenting
+  `LoopClosing::NewDetectCommonRegions` to see whether merge candidates are returned at
+  all.
+- `map_epoch` does not catch every reset. `LocalMapping::ResetIfRequested`'s active-map
+  branch clears the local mapper's queues and IMU state (`mTinit = 0`, `mbNotBA2 = true`)
+  without going through `Atlas::clearMap()` or `CreateNewMap()`, which are the only two
+  places `mnResetGeneration` increments. Observed live: a mapping pass printed "Not
+  enough motion for initializing. Reseting..." twice while `map_epoch` stayed at 1. It is
+  a lighter event than a full reset (map points survive), but anything counting resets
+  from `map_epoch` -- including `build_atlas_map.py`'s own report -- undercounts.
 - `IR_EXPOSURE_CAP_US` (`camera/camera_collecting.py`) was chosen to stop the *emitter's
   dot pattern* smearing under handheld motion. With the emitter now off for tracking, that
   basis no longer holds -- real world-fixed texture has a different blur budget, so the

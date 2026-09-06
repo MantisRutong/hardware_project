@@ -111,6 +111,16 @@ int orb_track_stereo(void *handle, double timestamp, int width, int height, cons
   return 1;
 }
 
+long orb_get_current_map_id(void *handle) {
+  if (handle == nullptr)
+    return 0;
+  auto *h = static_cast<OrbHandle *>(handle);
+  std::lock_guard<std::mutex> lck(h->mtx);
+  if (h->shut_down)
+    return 0;
+  return static_cast<long>(h->sys->GetCurrentMapId());
+}
+
 void orb_shutdown(void *handle) {
   if (handle == nullptr)
     return;

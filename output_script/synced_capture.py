@@ -512,6 +512,12 @@ class CombinedMonitor:
     # to start" otherwise. See recording_active in __init__.
     RECORDING_COLOR = (0, 0, 220)   # BGR: red
     IDLE_COLOR = (140, 140, 140)    # BGR: gray
+    # Recording AND the demo-start mark is set -- distinct from plain
+    # recording red so "did that keypress register" is answerable at a
+    # glance from across the room. Green because the useful part is what is
+    # being recorded from here on.
+    DEMO_COLOR = (0, 190, 0)        # BGR: green
+    WARN_COLOR = (0, 190, 220)      # BGR: amber -- working on it, not an error
     STATUS_BORDER_PX = 8
 
     def __init__(
@@ -526,6 +532,7 @@ class CombinedMonitor:
         on_start_requested: "Any" = None,
         recording_active: "Any" = None,
         on_episode_stop_requested: "Any" = None,
+        on_demo_start_requested: "Any" = None,
     ):
         self.cv2 = cv2_module
         self.window_seconds = window_seconds
@@ -555,6 +562,54 @@ class CombinedMonitor:
         # q/Esc/close, via on_stop_requested, actually stopped anything, and
         # that also aborts the whole batch, not just this episode).
         self.on_episode_stop_requested = on_episode_stop_requested
+        # Optional -- called (from this monitor thread) when 'm' is pressed
+        # WHILE recording, to mark where the demonstration itself starts.
+        #
+        # A recording begins with warm-up: deliberate sweeping motion so
+        # ORB-SLAM3 can relocalize into the loaded atlas. That motion is
+        # necessary to RECORD (replay_slam.py has nothing else to relocalize
+        # from) and useless to TRAIN on -- measured on scan_0011, the first
+        # grasp is at t=46s of a 61.5s recording, and the trajectory before
+        # it sweeps 25-46cm per 5s window while the gripper sits at 80.0mm,
+        # i.e. wide open, the whole time. Exported unmarked, roughly two
+        # thirds of that episode teaches the policy to sweep.
+        #
+        # Nothing can infer this boundary reliably. The obvious heuristic --
+        # first gripper closure -- is wrong: approaching an object with the
+        # gripper open is part of the demonstration, and some tasks start
+        # already holding something. The reference UMI pipeline does not
+        # guess either; its 06_generate_dataset_plan.py filters on a
+        # check_result.txt a human wrote after watching the video. This is
+        # the same human judgement, moved to the moment it is obvious.
+        #
+        # Idempotent in the sense that matters: pressing again overwrites,
+        # so marking too early is fixed by marking again.
+        self.on_demo_start_requested = on_demo_start_requested
+        # Set by main() once 'm' has been pressed this episode, purely so
+        # the window can say so -- without feedback there is no way to tell
+        # a press that registered from one that missed.
+        self.demo_start_offset_s: float | None = None
+        # Set by main()'s _on_orb_pose when live tracking is on. None means
+        # there is no live tracker, and the panel stays quiet rather than
+        # showing a status that means nothing.
+        #
+        # This answers the one question the operator has during warm-up:
+        # can I start the demonstration yet? And it is NOT "is tracking
+        # working" -- tracking works long before the answer is yes.
+        #
+        # What actually has to be true is that the map has completed IMU
+        # BA2. LocalMapping's "Not enough motion for initializing" reset --
+        # the one that made careful pick-and-place untrackable, 33% of
+        # frames over scan_0006-0009 -- is gated on !GetIniertialBA2(). Once
+        # that flag is set the gate stops applying for the rest of the
+        # recording, so small careful motion becomes safe. A loaded atlas
+        # was only ever a way to get the same flag without earning it.
+        #
+        # "atlas" is appended when tracking has additionally merged into a
+        # loaded map (see OrbSlamTracker.current_map_id). Nice to know, and
+        # required for a world frame that survives across sessions, but not
+        # what gates starting the demo.
+        self.tracking_status: str | None = None
         # Optional -- the same threading.Event RealSenseCapture/ServoPoller
         # already use to gate whether frames/samples actually get recorded
         # (capture.active). Read-only here, both to show the recording
@@ -618,6 +673,18 @@ class CombinedMonitor:
         status_color = self.RECORDING_COLOR if is_recording else self.IDLE_COLOR
         cv2.putText(panel, status_text, (margin, 38),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2 if is_recording else 1, cv2.LINE_AA)
+
+        # Tracking readiness, right under the recording line -- the thing to
+        # read before pressing 'm'. See self.tracking_status.
+        if self.tracking_status is not None:
+            text, color = {
+                "ready": ("READY -- initialized, safe to press 'm'", self.DEMO_COLOR),
+                "ready_atlas": ("READY + merged into atlas", self.DEMO_COLOR),
+                "warming": ("warming up... keep translating 20-30cm", self.WARN_COLOR),
+                "lost": ("TRACKING LOST", self.RECORDING_COLOR),
+            }[self.tracking_status]
+            cv2.putText(panel, text, (margin, 58),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2, cv2.LINE_AA)
 
         if len(self.times) >= 2:
             t0, t1 = self.times[0], self.times[-1]
@@ -707,8 +774,17 @@ class CombinedMonitor:
         # this never touches the original pending frame buffer.
         is_recording = self.recording_active is not None and self.recording_active.is_set()
         border_color = self.RECORDING_COLOR if is_recording else self.IDLE_COLOR
+        if is_recording and self.demo_start_offset_s is not None:
+            border_color = self.DEMO_COLOR
         cv2.rectangle(combined, (0, 0), (combined.shape[1] - 1, combined.shape[0] - 1),
                       border_color, self.STATUS_BORDER_PX)
+        # Text as well as colour: the offset is the thing worth reading back
+        # (it is how long the warm-up took), and colour alone cannot carry it.
+        if is_recording:
+            label = (f"DEMO +{self.demo_start_offset_s:.1f}s" if self.demo_start_offset_s is not None
+                     else "warm-up -- press 'm' when the demo starts")
+            cv2.putText(combined, label, (12, combined.shape[0] - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, border_color, 2, cv2.LINE_AA)
 
         cv2.imshow(self.WINDOW_NAME, combined)
         key = cv2.waitKey(1) & 0xFF
@@ -731,6 +807,14 @@ class CombinedMonitor:
                     self.on_episode_stop_requested()
             elif self.on_start_requested is not None:
                 self.on_start_requested()
+        # 'm' = mark where the demonstration starts, i.e. where warm-up ends
+        # -- see on_demo_start_requested in __init__. Only meaningful while
+        # recording; ignored otherwise rather than silently remembered, so
+        # it cannot leak into the next episode.
+        elif key == ord("m"):
+            if (self.recording_active is not None and self.recording_active.is_set()
+                    and self.on_demo_start_requested is not None):
+                self.on_demo_start_requested()
 
     def close(self) -> None:
         """Ask the monitor thread to stop and wait briefly for it -- safe to
@@ -865,6 +949,103 @@ def write_camera_trajectory_csv(path: Path, trajectory_rows: list[dict[str, Any]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(trajectory_rows)
+
+
+def read_tum_trajectory(path: Path) -> dict[str, tuple]:
+    """Parse ORB-SLAM3's own TUM dump into {timestamp_key: (x,y,z,qx,qy,qz,qw)}.
+
+    Keyed by the timestamp string rather than the float so the join in
+    write_refined_camera_trajectory_csv can't miss on a last-bit difference:
+    SaveTrajectoryTUM writes the timestamp at setprecision(6), and these are
+    Unix epoch seconds (~1.79e9), so the printed value is what both sides
+    have to agree on."""
+    poses: dict[str, tuple] = {}
+    if not path.is_file():
+        return poses
+    with path.open() as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) != 8:
+                continue
+            poses[f"{float(parts[0]):.6f}"] = tuple(float(v) for v in parts[1:])
+    return poses
+
+
+def write_refined_camera_trajectory_csv(
+    path: Path, live_rows: list[dict[str, Any]], tum_poses: dict[str, tuple]
+) -> dict[str, Any]:
+    """Re-emit the episode's trajectory from ORB-SLAM3's FINAL map, rather
+    than from what it reported live, frame by frame.
+
+    ## Why this file exists alongside camera_trajectory.csv
+
+    A live pose is whatever the tracker believed at that instant. Two things
+    can invalidate that belief later in the same episode:
+
+      - a reset, which map_epoch already flags (see
+        write_camera_trajectory_csv), and
+      - a MERGE into a loaded atlas, which map_epoch does NOT flag.
+
+    The merge is the dangerous one. When the session's own map is recognized
+    as somewhere the loaded atlas already covers, LoopClosing rigidly
+    transforms every keyframe and map point into the atlas's frame
+    (ApplyScaledRotation, LoopClosing.cc) and switches the active map
+    (Atlas::ChangeMap). Neither touches Atlas's reset counter, because both
+    of its increment sites are reset paths (CreateNewMap/clearMap). So the
+    pose origin moves mid-episode with nothing marking it: observed live as
+    a 38cm step between two consecutive 10Hz rows, is_lost=0 and map_epoch
+    unchanged on both sides. Every downstream check calls that data healthy.
+
+    ORB-SLAM3 already solves this for offline use, and the official UMI
+    pipeline relies on it: Tracking stores each frame's pose RELATIVE to its
+    reference keyframe (mlRelativeFramePoses), and System::SaveTrajectoryTUM
+    resolves it at save time as `Trw * pKF->GetPose() * Two` using that
+    keyframe's FINAL pose. Merges and bundle adjustment move keyframes; the
+    frame-to-keyframe relation survives, so every frame comes out in one
+    frame -- the final map's -- with the merge discontinuity absorbed rather
+    than recorded. Frames whose map was later discarded by a reset are
+    marked lost by Tracking::ResetActiveMap and skipped on the way out.
+
+    After a merge that final frame is the ATLAS's own (SaveTrajectoryTUM
+    normalizes to the lowest-id keyframe of the current map, which post-merge
+    is one of the atlas's), so refined trajectories from different episodes
+    that both merged share one world frame.
+
+    ## What this writes
+
+    Same schema as camera_trajectory.csv, so consumers need no special case.
+    Rows are the live rows with x..q_w replaced where the refined dump has
+    that timestamp; a live row with no refined counterpart is a frame
+    ORB-SLAM3 ended up considering lost, and is written as is_lost=1 with the
+    usual placeholders. map_epoch is carried over unchanged -- it still
+    describes what happened during the run, and a refined file that spans a
+    RESET is still discontinuous (a reset destroys the keyframes, so there is
+    nothing to re-resolve those frames against). Splitting on map_epoch stays
+    correct; this only removes the discontinuities that map_epoch could never
+    see.
+
+    Returns a summary for the caller to report."""
+    refined_rows: list[dict[str, Any]] = []
+    n_refined = 0
+    max_shift = 0.0
+    for row in live_rows:
+        key = f"{float(row['timestamp']):.6f}"
+        pose = tum_poses.get(key)
+        if pose is None:
+            refined_rows.append({**row, "x": 0.0, "y": 0.0, "z": 0.0,
+                                 "q_x": 0.0, "q_y": 0.0, "q_z": 0.0, "q_w": 1.0,
+                                 "is_lost": 1})
+            continue
+        x, y, z, qx, qy, qz, qw = pose
+        if row["is_lost"] == 0:
+            max_shift = max(max_shift, float(np.linalg.norm(
+                np.array([x, y, z]) - np.array([row["x"], row["y"], row["z"]]))))
+        refined_rows.append({**row, "x": x, "y": y, "z": z,
+                             "q_x": qx, "q_y": qy, "q_z": qz, "q_w": qw,
+                             "is_lost": 0})
+        n_refined += 1
+    write_camera_trajectory_csv(path, refined_rows)
+    return {"rows": len(refined_rows), "refined": n_refined, "max_shift_m": max_shift}
 
 
 def write_servo_csv(path: Path, matched_rows: list[dict[str, Any]]) -> None:
@@ -1035,24 +1216,43 @@ def parse_args() -> argparse.Namespace:
                               f"value, since the calibration CSV's kinematic model overshoots it near full-open. "
                               f"Default {GRIPPER_MAX_WIDTH_MM:.1f} (measured 2026-08-19).")
 
-    # Live ORB-SLAM3 (Stereo-Inertial) tracking -- see orbslam_bridge.py. This
-    # is the primary/default live tracker (see module-level comment above
-    # DEFAULT_OPENVINS_CONFIG for why). Needs stereo IR, so enabling this
-    # also turns on --ir-flag-equivalent stereo capture on RealSenseCapture
-    # (see record_ir=args.orbslam below) -- there's no separate --ir-flag
-    # here, since IR is only ever needed for ORB-SLAM3 in this script. Fed
-    # the full native-rate IMU stream (via on_imu_sample, paired
+    # Live ORB-SLAM3 (Stereo-Inertial) tracking -- see orbslam_bridge.py.
+    #
+    # OFF by default: recording and tracking are now separate steps for data
+    # collection. Record here, then run output_script/replay_slam.py over
+    # the result, then export. Measured on scan_0011, same recording both
+    # ways: live produced 582 tracked poses and 581 exported frames across
+    # 4 episodes (3 of them coordinate-frame splits), replay produced 1614
+    # and 1557 in ONE episode with zero splits. The reasons are structural,
+    # not incidental -- live tracking has to share the machine with the
+    # capture thread and so runs at 10Hz against the camera's 30, and it
+    # only ever gets one attempt at a recording, with whatever atlas, mask
+    # and settings existed that day. See replay_slam.py's module docstring.
+    #
+    # Still here, and still the same code path, for two reasons: it is what
+    # umi_teleop.py does (driving an arm from a pose that arrives after the
+    # fact is not a thing), and a live run is the fastest way to check on
+    # the rig that tracking works at all before recording a batch.
+    #
+    # Fed the full native-rate IMU stream (via on_imu_sample, paired
     # nearest-gyro-to-accel same as OpenVINS's own fusion) and every stereo
     # frame pair (via RealSenseCapture's on_stereo_frame hook). A fresh
     # tracker is created per episode (System has no in-place reset exposed
     # here -- see orbslam_bridge.py's docstring), so each episode's
     # camera_trajectory.csv starts its own clean map/pose graph near t=0.
-    parser.add_argument("--orbslam", dest="orbslam", action=argparse.BooleanOptionalAction, default=True,
-                         help="Run live ORB-SLAM3 Stereo-Inertial tracking alongside recording (default: on, "
-                              "the primary live tracker -- see --openvins for the deprecated/comparison-only "
-                              "monocular alternative). Prints tracked position periodically and writes "
-                              "camera_trajectory.csv per episode. Also enables stereo IR capture (ir_left/ "
-                              "ir_right). Use --no-orbslam to skip entirely (e.g. if ORB_SLAM3 isn't built).")
+    parser.add_argument("--orbslam", dest="orbslam", action=argparse.BooleanOptionalAction, default=False,
+                         help="Run live ORB-SLAM3 Stereo-Inertial tracking alongside recording (default: OFF). "
+                              "The recorded trajectory now comes from replay_slam.py afterwards, which tracks "
+                              "the same frames at full rate against a final map -- roughly 2.7x the poses and "
+                              "no unflagged coordinate-frame splits. Turn this on to sanity-check tracking on "
+                              "the rig before recording a batch (it prints tracked position and writes "
+                              "camera_trajectory.csv), not to produce the trajectory you train on. Stereo IR "
+                              "capture is independent of this now -- see --record-ir.")
+    parser.add_argument("--record-ir", dest="record_ir", action=argparse.BooleanOptionalAction, default=True,
+                         help="Save the left/right IR streams (default: on). These are what replay_slam.py "
+                              "tracks afterwards, so a recording made without them can never be re-tracked -- "
+                              "the pose labels would have to come from a live run, or not at all. Used to be "
+                              "implied by --orbslam, back when live tracking was the only consumer.")
     parser.add_argument("--orbslam-settings", type=Path, default=ORBSLAM_DEFAULT_SETTINGS_PATH, dest="orbslam_settings",
                          help=f"ORB-SLAM3 settings YAML (calibration) to use. Default: {ORBSLAM_DEFAULT_SETTINGS_PATH}")
     parser.add_argument("--orbslam-vocab", type=Path, default=ORBSLAM_DEFAULT_VOCAB_PATH, dest="orbslam_vocab",
@@ -1252,13 +1452,14 @@ def main() -> int:
             enable_imu=True,
             record_rgb=True,
             record_depth=args.depth_flag,
-            # ORB-SLAM3 Stereo-Inertial needs left/right IR -- there's no
-            # separate --ir-flag on this script since IR is only ever needed
-            # here for --orbslam. requested_ir left as None (auto-negotiate
-            # from camera_collecting.py's IR_PROFILES) since --orbslam-settings'
-            # calibration was measured at that same auto-negotiated 848x480
-            # default (see ORB_SLAM3/config/RealSense_D435i_ours.yaml).
-            record_ir=args.orbslam,
+            # Stereo-Inertial needs left/right IR, live or offline, so this
+            # is on by default and no longer tied to --orbslam: the frames
+            # replay_slam.py tracks later are exactly these. requested_ir
+            # left as None (auto-negotiate from camera_collecting.py's
+            # IR_PROFILES) since --orbslam-settings' calibration was measured
+            # at that same auto-negotiated 848x480 default (see
+            # ORB_SLAM3/config/RealSense_D435i_ours.yaml).
+            record_ir=args.record_ir,
             queue_size=args.queue_size,
             imu_fps=args.imu_fps,
             # Not using RealSenseCapture's own cv2 preview window -- Combined
@@ -1397,6 +1598,13 @@ def main() -> int:
             orb_last_print = [0.0]  # mutable box, see _on_orb_pose
             orb_last_map_epoch: list[int | None] = [None]  # mutable box, see _on_orb_pose
             orb_map_resets = [0]  # mutable box, see _on_orb_pose
+            # The map id ORB-SLAM3 cold-started into for the current epoch --
+            # see _on_orb_pose's atlas-status block for why a merge is
+            # detected as "this changed while map_epoch did not". Must be
+            # bound before _on_orb_pose is DEFINED, not merely before it
+            # runs: it is passed as a default argument, like every other
+            # per-episode box here, and defaults evaluate at definition time.
+            orb_session_map_id: list[tuple[int, int, bool] | None] = [None]
 
             def _on_orb_pose(
                 ts: float,
@@ -1406,6 +1614,10 @@ def main() -> int:
                 last_print: list[float] = orb_last_print,
                 last_map_epoch: list[int | None] = orb_last_map_epoch,
                 map_resets: list[int] = orb_map_resets,
+                mon: Any = monitor,
+                orb: OrbSlamTracker | None = orb_tracker,
+                session_map: list[tuple[int, int, bool] | None] = orb_session_map_id,
+                using_atlas: bool = args.orbslam_map_dir is not None,
             ) -> None:
                 # Runs on OrbSlamWorker's own thread, not the capture thread
                 # -- see that class's docstring. trajectory/last_print/
@@ -1451,6 +1663,46 @@ def main() -> int:
                         {"timestamp": ts, "x": 0.0, "y": 0.0, "z": 0.0, "q_x": 0.0, "q_y": 0.0, "q_z": 0.0, "q_w": 1.0,
                          "is_lost": 1, "map_epoch": map_epoch}
                     )
+
+                # Atlas relocalization status for the monitor -- only
+                # meaningful with a map loaded, so left untouched otherwise.
+                #
+                # A MERGE is "the active map changed while map_epoch did
+                # NOT", which is exactly the pair of facts that distinguishes
+                # it from a reset: a reset creates a new map too (so the id
+                # also changes) but bumps the epoch, while ChangeMap on merge
+                # leaves the epoch alone. Tracking each session map against
+                # the epoch it belongs to means a reset re-arms the indicator
+                # rather than falsely latching it green forever.
+                if orb is not None and mon is not None:
+                    # State is kept as (epoch, session map id, merged) in one
+                    # box, and the status is recomputed from it on EVERY
+                    # call. Two bugs came from not doing that: the epoch was
+                    # compared against last_map_epoch[0] after the line above
+                    # had already overwritten it (so a reset never re-armed
+                    # the indicator), and the status was only assigned inside
+                    # the branches, so the first few frames before the map
+                    # initializes set "lost" and nothing ever set it back --
+                    # it stayed red for the rest of the episode no matter
+                    # what tracking did.
+                    map_id = orb.current_map_id
+                    prev = session_map[0]
+                    if prev is None or prev[0] != map_epoch:
+                        # New epoch: a reset just created another map for
+                        # this session, so any merge has to happen again.
+                        session_map[0] = (map_epoch, map_id, False)
+                    elif using_atlas and not prev[2] and map_id != prev[1]:
+                        # Same epoch, different map -- ChangeMap, i.e. merged.
+                        session_map[0] = (prev[0], prev[1], True)
+                    if pose is None:
+                        mon.tracking_status = "lost"
+                    elif not orb.place_recognition_gates["imu_ba2"]:
+                        # Tracking works here, but the init gate is still
+                        # armed -- the regime that made careful manipulation
+                        # untrackable. Not ready.
+                        mon.tracking_status = "warming"
+                    else:
+                        mon.tracking_status = "ready_atlas" if session_map[0][2] else "ready"
 
             orb_worker = (
                 OrbSlamWorker(orb_tracker, _on_orb_pose, gripper_masks=gripper_masks)
@@ -1571,8 +1823,36 @@ def main() -> int:
             cam.write_calibration(rs, capture.profile, scan_dir / "calibration.json", args.depth_flag)
 
             start_event = threading.Event()
+            # Host clock, in a one-element list so the monitor thread's
+            # callback can write it and the metadata block below can read
+            # it -- same pattern the per-episode ORB-SLAM3 state uses. None
+            # until 'm' is pressed, and None is a meaningful value: it means
+            # this episode has no marked demo start, which export_dataset.py
+            # reports rather than silently treating the warm-up as demo.
+            demo_start_host_ns: list[int | None] = [None]
             if monitor is not None:
                 monitor.on_start_requested = start_event.set
+                monitor.demo_start_offset_s = None  # this episode's own mark, not the last one's
+
+                def _on_demo_start(
+                    mon: Any = monitor,
+                    holder: list[int | None] = demo_start_host_ns,
+                    cap: Any = capture,
+                ) -> None:
+                    """Runs on the monitor thread when 'm' is pressed while
+                    recording. time.time_ns() is the same clock every stream
+                    is already stamped with (host_time_ns everywhere in this
+                    file), so the mark needs no conversion to be comparable
+                    with frames.csv."""
+                    now_ns = time.time_ns()
+                    holder[0] = now_ns
+                    first = cap.frame_rows[0]["host_time_ns"] if cap.frame_rows else now_ns
+                    offset = (now_ns - first) / 1e9
+                    mon.demo_start_offset_s = offset
+                    print(f"\n[demo] start marked at +{offset:.1f}s -- everything before this is warm-up "
+                          f"and will be dropped on export.")
+
+                monitor.on_demo_start_requested = _on_demo_start
 
             print(f"\n=== Episode {episode_idx}/{args.episodes} -- output: {scan_dir} ===")
             print("Press Enter to start capture (in this terminal, or in the monitor window if it has focus)...")
@@ -1585,19 +1865,42 @@ def main() -> int:
                 event.set()
 
             threading.Thread(target=_wait_for_terminal_enter, daemon=True).start()
-            start_event.wait()
+            try:
+                start_event.wait()
+            except KeyboardInterrupt:
+                # The other place Ctrl+C can land: waiting to START an
+                # episode, rather than inside capture() which catches it
+                # itself. Nothing has been recorded yet, so just stop --
+                # quietly, since a traceback here would say nothing a user
+                # who pressed Ctrl+C does not already know. The outer
+                # finally still closes the monitor and the servo poller.
+                print("\nCtrl+C -- stopping.")
+                abort_batch_event.set()
 
             if abort_batch_event.is_set():
                 print("Batch stopped before this episode started recording.")
                 break
 
             def _wait_for_stop(event: threading.Event = capture.stop_event) -> None:
-                input("Recording... press Enter to stop.\n")
+                input("Recording... press 'm' in the monitor window when the demo itself starts "
+                      "(everything before it is warm-up), then Enter here to stop.\n")
                 event.set()
 
             threading.Thread(target=_wait_for_stop, daemon=True).start()
 
             capture_result = capture.capture()
+            if capture_result.get("interrupted"):
+                # RealSenseCapture catches KeyboardInterrupt itself, so that
+                # this episode's frames still get written instead of dying
+                # mid-drain -- but it then returns normally, and without this
+                # the batch loop would just start the next episode and wait
+                # for Enter again. From the terminal that looks exactly like
+                # Ctrl+C did nothing.
+                #
+                # This episode is still finished and written out below; only
+                # the ones after it are dropped.
+                print("Ctrl+C -- finishing this episode, then stopping the batch.")
+                abort_batch_event.set()
 
             # Drain OrbSlamWorker before reading orb_trajectory below: it
             # runs on its own thread (see that class's docstring), so the
@@ -1637,6 +1940,41 @@ def main() -> int:
                       f"-> wrote {scan_dir / 'camera_trajectory.csv'}")
                 if orb_worker is not None:
                     print(orb_worker.stats_summary())
+
+                # Second, better trajectory, resolved from the FINAL map --
+                # see write_refined_camera_trajectory_csv for why the live
+                # one is not enough on its own. Shutting the tracker down
+                # here is required (SaveTrajectoryTUM needs the mapping and
+                # loop-closing threads stopped) and costs nothing: this
+                # handle is discarded either way, at the top of the next
+                # episode or at the end of the session.
+                # Guarded on n_tracked: System::SaveTrajectoryTUM opens with
+                # `vpKFs[0]->GetPoseInverse()` on an unchecked vector, so an
+                # episode whose map never initialized would take the process
+                # down in C++, where no Python except can catch it.
+                if n_tracked == 0:
+                    print("ORB-SLAM3 refined: skipped -- nothing was tracked this episode.")
+                try:
+                    if n_tracked > 0:
+                        orb_tracker.shutdown()
+                        tum_path = scan_dir / "camera_trajectory_orbslam.tum"
+                        orb_tracker.save_trajectory_tum(tum_path)
+                        stats = write_refined_camera_trajectory_csv(
+                            scan_dir / "camera_trajectory_refined.csv",
+                            orb_trajectory,
+                            read_tum_trajectory(tum_path),
+                        )
+                        print(f"ORB-SLAM3 refined: {stats['refined']}/{stats['rows']} frames re-resolved "
+                              f"against the final map, largest correction {stats['max_shift_m'] * 100:.1f} cm "
+                              f"-> wrote {scan_dir / 'camera_trajectory_refined.csv'}")
+                        if stats["max_shift_m"] > 0.05:
+                            print("  (a correction that large means the live trajectory contained a "
+                                  "coordinate-frame shift -- an atlas merge, or bundle adjustment. "
+                                  "Prefer camera_trajectory_refined.csv downstream.)")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"ORB-SLAM3 refined: FAILED ({exc}) -- "
+                          f"camera_trajectory.csv (live) is still written and usable, but it may "
+                          f"contain an unflagged coordinate-frame shift if an atlas merge happened.")
                 if ov_tracker is not None:
                     write_camera_trajectory_csv(scan_dir / "camera_trajectory_openvins.csv", ov_trajectory)
                     n_tracked_ov = sum(1 for r in ov_trajectory if r["is_lost"] == 0)
@@ -1662,6 +2000,16 @@ def main() -> int:
                     "script": Path(__file__).name,
                     "episode_index": episode_idx,
                     "episodes_requested": args.episodes,
+                    # Where the demonstration itself starts, if 'm' was
+                    # pressed (see CombinedMonitor.on_demo_start_requested).
+                    # Absent/null means unmarked -- export_dataset.py then
+                    # exports the whole episode and says so, rather than
+                    # guessing where the warm-up ended.
+                    "demo_start_host_ns": demo_start_host_ns[0],
+                    "demo_start_offset_s": (
+                        round((demo_start_host_ns[0] - capture.frame_rows[0]["host_time_ns"]) / 1e9, 2)
+                        if demo_start_host_ns[0] is not None and capture.frame_rows else None
+                    ),
                     "servo": {
                         "port": port,
                         "baud": args.servo_baud,
