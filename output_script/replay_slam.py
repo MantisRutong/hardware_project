@@ -249,6 +249,17 @@ def replay_episode(episode_dir: Path, args: argparse.Namespace) -> dict[str, Any
     unreadable = 0
     skipped_no_imu = 0
     imu_since_last_frame = 0
+    # Did tracking ever reach the LOADED atlas, and when? Loading a map does
+    # not put tracking into it: the session cold-starts its own map and stays
+    # there until LoopClosing recognises the region and Atlas::ChangeMap
+    # switches over (see OrbSlamTracker.current_map_id). A merge is "the map
+    # id changed while map_epoch did NOT" -- a reset changes the id too, but
+    # bumps the epoch, so tracking each session map against its own epoch
+    # keeps the two apart. None means it never happened, which is a result
+    # worth reporting rather than an absence: it means the atlas was loaded
+    # and not used.
+    merged_at_s: float | None = None
+    session_map_id: int | None = None
     started = time.monotonic()
     try:
         for i, frame in enumerate(frames):
@@ -315,6 +326,14 @@ def replay_episode(episode_dir: Path, args: argparse.Namespace) -> dict[str, Any
             epoch = tracker.last_map_epoch
             if last_epoch is not None and epoch != last_epoch:
                 resets += 1
+            if args.map_dir is not None and merged_at_s is None:
+                map_id = tracker.current_map_id
+                if session_map_id is None or epoch != last_epoch:
+                    session_map_id = map_id      # this epoch's own cold-started map
+                elif map_id != session_map_id:
+                    merged_at_s = ts - frames[0]["timestamp"]
+                    print(f"\n  merged into the loaded atlas at +{merged_at_s:.1f}s "
+                          f"(map {session_map_id} -> {map_id})")
             last_epoch = epoch
             if pose is None:
                 trajectory.append({"timestamp": ts, "x": 0.0, "y": 0.0, "z": 0.0,
@@ -341,6 +360,7 @@ def replay_episode(episode_dir: Path, args: argparse.Namespace) -> dict[str, Any
             "map_resets": resets,
             "unreadable_frames": unreadable,
             "skipped_no_imu": skipped_no_imu,
+            "merged_into_atlas_at_s": merged_at_s,
             "seconds": round(time.monotonic() - started, 1),
         }
 
@@ -473,6 +493,9 @@ def main() -> None:
         pct = 100.0 * s["frames_tracked"] / max(1, s["frames_total"])
         line = (f"  {Path(s['episode_dir']).name}: tracked {s['frames_tracked']}/{s['frames_total']} "
                 f"({pct:.0f}%), resets {s['map_resets']}, {s['seconds']}s")
+        if args.map_dir is not None:
+            m = s.get("merged_into_atlas_at_s")
+            line += f", atlas merge {'+%.1fs' % m if m is not None else 'NEVER'}"
         if isinstance(s.get("refined"), dict):
             line += (f", refined {s['refined']['refined']}/{s['refined']['rows']}"
                      f", jumps {s['speed_jumps_live']} -> {s['speed_jumps_refined']}")
