@@ -73,6 +73,31 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
   - `include/Atlas.h` / `src/Atlas.cc`: the actual counter (`mnResetGeneration`),
     incremented inside both `CreateNewMap()` and `clearMap()` so it catches every reset
     path, backing `System::GetMapEpoch()` above.
+  - `src/Optimizer.cc`: fixes vertex-id collisions in `LocalInertialBA()` and
+    `MergeInertialBA()`. Both pack three kinds of g2o vertex into one id space against
+    `maxKFid` (pose `= mnId`, velocity/bias `= maxKFid + 3*mnId + {1,2,3}`, map point
+    `= maxKFid*5 + mnId + 1`), but upstream sets `maxKFid` to the *current* keyframe's id
+    rather than the largest one in the optimization. Any keyframe above that lands its
+    pose vertex inside the IMU range, and g2o rejects the duplicate ("addVertex: FATAL, a
+    vertex with ID N has already been registered") -- rejected vertices are silently left
+    out of the graph and edges then resolve that id to a vertex of the wrong type. This
+    only shows up once an atlas is **loaded**: cold-started ids ascend with the current
+    keyframe, so upstream's value happens to be the maximum. A loaded map's ids and the
+    session's interleave. Observed live as 20 rejected vertices in two clusters during a
+    single merge. Computing `maxKFid` properly also retires the `if(pKFi->mnId > maxKFid)
+    continue;` guard in `MergeInertialBA`'s observation loop, which existed only to paper
+    over the overflow and dropped otherwise-valid observations.
+  - `src/System.cc`: `Shutdown()` now actually waits for the mapping and loop-closing
+    threads to stop (bounded at 20s, then says so loudly and continues). Upstream requests
+    them to finish and returns immediately -- the wait is present but commented out --
+    while everything after that point walks the atlas: `SaveAtlas()`, and the
+    `SaveTrajectoryTUM()` / `SaveKeyFrameTrajectory*()` calls that callers are told to make
+    *after* `Shutdown()`. Those were reading containers `LocalMapping` and `LoopClosing`
+    were still mutating; neither thread is ever joined either. Seen three times on this
+    project before the change: `free(): corrupted unsorted chunks` right after an atlas
+    save, and `FATAL: exception not rethrown` + `SIGABRT` at process exit after a
+    recording -- in every case the output file was already complete, which is what a
+    teardown-only race looks like.
   - `Examples/*.cc`: three example binaries had `bUseViewer` flipped `true`->`false`;
     unrelated to our tracking path (different dataset-replay examples), left over from
     getting the initial build working headless on this machine.
@@ -83,6 +108,10 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
   camera, instead of ORB-SLAM3 opening its own RealSense connection the way the stock
   `Examples/Stereo-Inertial/stereo_inertial_realsense_D435i.cc` example does. Mirrors
   `open_vins/ov_msckf/src/ov_capi.h`'s role for OpenVINS in this same project.
+  Besides per-frame tracking it exposes `orb_shutdown()` and
+  `orb_save_trajectory_tum()`, which is what makes the refined trajectory below
+  possible -- ORB-SLAM3 will only resolve frame poses against the final map after
+  its threads have stopped.
 - **`new_files/config/RealSense_D435i_ours.yaml`** -- Stereo-Inertial calibration
   measured live from this specific D435I unit (serial 346222071398) via
   `rs-enumerate-devices -c`, not assumed/borrowed. See the file's own header comment
@@ -104,7 +133,11 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
   `write_camera_trajectory_csv` for what a reset means for that file, and for
   downstream training-data use). Also auto-enables stereo IR capture
   (`camera/camera_collecting.py`'s `record_ir`) since Stereo-Inertial tracking needs
-  both IR streams, not just color.
+  both IR streams, not just color. At the end of each episode it additionally writes
+  `camera_trajectory_refined.csv` -- same schema, same `map_epoch` column, but re-resolved
+  against the final map. See **Refined trajectories** below for why that file exists and
+  why downstream should prefer it (`output_script/export_dataset.py` already does, falling
+  back to the live file for episodes recorded before it existed).
 - `output_script/build_atlas_map.py` + `synced_capture.py --orbslam-map-dir` -- the
   two-stage approach: build a persistent map ONCE from a deliberate mapping pass, then
   LOCALIZE every demo against it rather than cold-starting a fresh map per episode.
@@ -166,6 +199,43 @@ Mechanics worth knowing before running either half:
   `config/RealSense_D435i_ours_mapping.yaml` and `..._relocalize.yaml` -- identical
   calibration to `..._ours.yaml`, plus that one key.
 
+### Refined trajectories
+
+Loading an atlas introduces a failure the live trajectory cannot flag. `map_epoch` catches
+every **reset**, but not a **merge**: when the session's own map is recognized as somewhere
+the loaded atlas already covers, `LoopClosing` rigidly transforms every keyframe and map
+point into the atlas's frame (`ApplyScaledRotation`) and switches the active map
+(`Atlas::ChangeMap`). Neither touches the reset counter, because both of its increment
+sites are reset paths. So the pose origin moves mid-episode with nothing marking it --
+observed live as a 38cm step between two consecutive 10Hz rows, `is_lost=0` and `map_epoch`
+unchanged on both sides. Every downstream sanity check calls that data healthy.
+
+ORB-SLAM3 already solves this for offline use, and the official UMI pipeline relies on it:
+`Tracking` stores each frame's pose *relative to its reference keyframe*
+(`mlRelativeFramePoses`), and `System::SaveTrajectoryTUM` resolves it at save time as
+`Trw * pKF->GetPose() * Two` using that keyframe's **final** pose. Merges and bundle
+adjustment move keyframes; the frame-to-keyframe relation survives, so every frame comes
+out in one frame -- the final map's -- with the merge discontinuity absorbed rather than
+recorded. After a merge that frame is the *atlas's* own, so refined trajectories from
+different episodes that both merged share one world frame.
+
+So each episode ends with `orb_shutdown()` (the wait added to `System::Shutdown()` above is
+what makes this safe), then `orb_save_trajectory_tum()` into
+`camera_trajectory_orbslam.tum`, which `write_refined_camera_trajectory_csv()`
+(`synced_capture.py`) joins back onto the live rows by timestamp to produce
+`camera_trajectory_refined.csv`. Frames the tracker ended up considering lost are written
+`is_lost=1`. `map_epoch` is carried over unchanged -- it still describes what happened
+during the run, and a refined file spanning a **reset** is still discontinuous (a reset
+destroys the keyframes, so there is nothing to re-resolve those frames against). Splitting
+on `map_epoch` stays correct; this only removes the discontinuities `map_epoch` could never
+see. The per-episode print reports the largest correction applied; anything above ~5cm
+means the live trajectory did contain a coordinate-frame shift.
+
+Note that the tracker is torn down and reconstructed per episode
+(`construct_orb_tracker()`), so this costs one atlas reload per demo rather than one per
+batch -- the price of getting a final map to resolve against while the batch is still
+running.
+
 ### Scene texture
 
 With the emitter off (above), the workspace has to supply its own **world-fixed** texture.
@@ -191,12 +261,12 @@ Rearranging it means re-running `build_atlas_map.py`.
   10Hz (0.1s). This value was reached the hard way -- see the extensive comment above
   `OrbSlamWorker.__init__` in that file before changing it; a prior attempt at 20Hz
   reproduced a crash that took several rounds of live testing to root-cause and fix.
-- ORB-SLAM3 resets mid-recording are real and were observed live (not rare) --
-  `map_epoch` in `camera_trajectory.csv` flags them, but nothing downstream currently
-  *acts* on that (e.g. splitting an episode into per-segment trajectories for training).
-  The two-stage approach above is aimed squarely at removing the dominant cause of those
-  resets, so per-segment splitting may end up unnecessary -- but `map_epoch` is still the
-  thing to check to find out, and nothing consumes it yet either way.
+- ORB-SLAM3 resets mid-recording are real and were observed live (not rare). `map_epoch`
+  flags them and `output_script/export_dataset.py` now acts on it, splitting a recording
+  into one training episode per contiguous `map_epoch` segment rather than training across
+  a coordinate-frame teleport. The two-stage approach above is aimed squarely at removing
+  the dominant cause of those resets; if it works, most recordings should come out as a
+  single segment, and `map_epoch` is still the thing to check to find out.
 - **None of the two-stage path has been validated on hardware yet.** The mapping script,
   the `--orbslam-map-dir` localize path, and the emitter change are all written and
   compile, but no live run has confirmed that resets actually drop. The order to test in:

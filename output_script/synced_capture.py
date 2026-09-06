@@ -867,6 +867,103 @@ def write_camera_trajectory_csv(path: Path, trajectory_rows: list[dict[str, Any]
         writer.writerows(trajectory_rows)
 
 
+def read_tum_trajectory(path: Path) -> dict[str, tuple]:
+    """Parse ORB-SLAM3's own TUM dump into {timestamp_key: (x,y,z,qx,qy,qz,qw)}.
+
+    Keyed by the timestamp string rather than the float so the join in
+    write_refined_camera_trajectory_csv can't miss on a last-bit difference:
+    SaveTrajectoryTUM writes the timestamp at setprecision(6), and these are
+    Unix epoch seconds (~1.79e9), so the printed value is what both sides
+    have to agree on."""
+    poses: dict[str, tuple] = {}
+    if not path.is_file():
+        return poses
+    with path.open() as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) != 8:
+                continue
+            poses[f"{float(parts[0]):.6f}"] = tuple(float(v) for v in parts[1:])
+    return poses
+
+
+def write_refined_camera_trajectory_csv(
+    path: Path, live_rows: list[dict[str, Any]], tum_poses: dict[str, tuple]
+) -> dict[str, Any]:
+    """Re-emit the episode's trajectory from ORB-SLAM3's FINAL map, rather
+    than from what it reported live, frame by frame.
+
+    ## Why this file exists alongside camera_trajectory.csv
+
+    A live pose is whatever the tracker believed at that instant. Two things
+    can invalidate that belief later in the same episode:
+
+      - a reset, which map_epoch already flags (see
+        write_camera_trajectory_csv), and
+      - a MERGE into a loaded atlas, which map_epoch does NOT flag.
+
+    The merge is the dangerous one. When the session's own map is recognized
+    as somewhere the loaded atlas already covers, LoopClosing rigidly
+    transforms every keyframe and map point into the atlas's frame
+    (ApplyScaledRotation, LoopClosing.cc) and switches the active map
+    (Atlas::ChangeMap). Neither touches Atlas's reset counter, because both
+    of its increment sites are reset paths (CreateNewMap/clearMap). So the
+    pose origin moves mid-episode with nothing marking it: observed live as
+    a 38cm step between two consecutive 10Hz rows, is_lost=0 and map_epoch
+    unchanged on both sides. Every downstream check calls that data healthy.
+
+    ORB-SLAM3 already solves this for offline use, and the official UMI
+    pipeline relies on it: Tracking stores each frame's pose RELATIVE to its
+    reference keyframe (mlRelativeFramePoses), and System::SaveTrajectoryTUM
+    resolves it at save time as `Trw * pKF->GetPose() * Two` using that
+    keyframe's FINAL pose. Merges and bundle adjustment move keyframes; the
+    frame-to-keyframe relation survives, so every frame comes out in one
+    frame -- the final map's -- with the merge discontinuity absorbed rather
+    than recorded. Frames whose map was later discarded by a reset are
+    marked lost by Tracking::ResetActiveMap and skipped on the way out.
+
+    After a merge that final frame is the ATLAS's own (SaveTrajectoryTUM
+    normalizes to the lowest-id keyframe of the current map, which post-merge
+    is one of the atlas's), so refined trajectories from different episodes
+    that both merged share one world frame.
+
+    ## What this writes
+
+    Same schema as camera_trajectory.csv, so consumers need no special case.
+    Rows are the live rows with x..q_w replaced where the refined dump has
+    that timestamp; a live row with no refined counterpart is a frame
+    ORB-SLAM3 ended up considering lost, and is written as is_lost=1 with the
+    usual placeholders. map_epoch is carried over unchanged -- it still
+    describes what happened during the run, and a refined file that spans a
+    RESET is still discontinuous (a reset destroys the keyframes, so there is
+    nothing to re-resolve those frames against). Splitting on map_epoch stays
+    correct; this only removes the discontinuities that map_epoch could never
+    see.
+
+    Returns a summary for the caller to report."""
+    refined_rows: list[dict[str, Any]] = []
+    n_refined = 0
+    max_shift = 0.0
+    for row in live_rows:
+        key = f"{float(row['timestamp']):.6f}"
+        pose = tum_poses.get(key)
+        if pose is None:
+            refined_rows.append({**row, "x": 0.0, "y": 0.0, "z": 0.0,
+                                 "q_x": 0.0, "q_y": 0.0, "q_z": 0.0, "q_w": 1.0,
+                                 "is_lost": 1})
+            continue
+        x, y, z, qx, qy, qz, qw = pose
+        if row["is_lost"] == 0:
+            max_shift = max(max_shift, float(np.linalg.norm(
+                np.array([x, y, z]) - np.array([row["x"], row["y"], row["z"]]))))
+        refined_rows.append({**row, "x": x, "y": y, "z": z,
+                             "q_x": qx, "q_y": qy, "q_z": qz, "q_w": qw,
+                             "is_lost": 0})
+        n_refined += 1
+    write_camera_trajectory_csv(path, refined_rows)
+    return {"rows": len(refined_rows), "refined": n_refined, "max_shift_m": max_shift}
+
+
 def write_servo_csv(path: Path, matched_rows: list[dict[str, Any]]) -> None:
     # Only frame/timing (to keep this aligned with servo.csv's usual role as
     # a per-stream file matching gyro.csv/accel.csv) plus gripper_width_mm --
@@ -1637,6 +1734,41 @@ def main() -> int:
                       f"-> wrote {scan_dir / 'camera_trajectory.csv'}")
                 if orb_worker is not None:
                     print(orb_worker.stats_summary())
+
+                # Second, better trajectory, resolved from the FINAL map --
+                # see write_refined_camera_trajectory_csv for why the live
+                # one is not enough on its own. Shutting the tracker down
+                # here is required (SaveTrajectoryTUM needs the mapping and
+                # loop-closing threads stopped) and costs nothing: this
+                # handle is discarded either way, at the top of the next
+                # episode or at the end of the session.
+                # Guarded on n_tracked: System::SaveTrajectoryTUM opens with
+                # `vpKFs[0]->GetPoseInverse()` on an unchecked vector, so an
+                # episode whose map never initialized would take the process
+                # down in C++, where no Python except can catch it.
+                if n_tracked == 0:
+                    print("ORB-SLAM3 refined: skipped -- nothing was tracked this episode.")
+                try:
+                    if n_tracked > 0:
+                        orb_tracker.shutdown()
+                        tum_path = scan_dir / "camera_trajectory_orbslam.tum"
+                        orb_tracker.save_trajectory_tum(tum_path)
+                        stats = write_refined_camera_trajectory_csv(
+                            scan_dir / "camera_trajectory_refined.csv",
+                            orb_trajectory,
+                            read_tum_trajectory(tum_path),
+                        )
+                        print(f"ORB-SLAM3 refined: {stats['refined']}/{stats['rows']} frames re-resolved "
+                              f"against the final map, largest correction {stats['max_shift_m'] * 100:.1f} cm "
+                              f"-> wrote {scan_dir / 'camera_trajectory_refined.csv'}")
+                        if stats["max_shift_m"] > 0.05:
+                            print("  (a correction that large means the live trajectory contained a "
+                                  "coordinate-frame shift -- an atlas merge, or bundle adjustment. "
+                                  "Prefer camera_trajectory_refined.csv downstream.)")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"ORB-SLAM3 refined: FAILED ({exc}) -- "
+                          f"camera_trajectory.csv (live) is still written and usable, but it may "
+                          f"contain an unflagged coordinate-frame shift if an atlas merge happened.")
                 if ov_tracker is not None:
                     write_camera_trajectory_csv(scan_dir / "camera_trajectory_openvins.csv", ov_trajectory)
                     n_tracked_ov = sum(1 for r in ov_trajectory if r["is_lost"] == 0)

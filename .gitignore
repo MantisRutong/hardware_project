@@ -9,3 +9,8 @@ teleop_frame.json
 
 # LibreOffice lock files
 .~lock.*#
+
+# Built ORB-SLAM3 atlases: a .osa plus the full IR/IMU recording of the
+# mapping pass. Large binaries, and regenerable by build_atlas_map.py --
+# same reason the ORB-SLAM3 and Pangolin trees are not checked in either.
+maps/

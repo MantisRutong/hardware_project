@@ -159,6 +159,24 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+def camera_trajectory_path(episode_dir: Path) -> Path:
+    """Prefer the refined trajectory when the episode has one.
+
+    camera_trajectory.csv is what ORB-SLAM3 reported live, frame by frame.
+    camera_trajectory_refined.csv is the same episode re-resolved from its
+    FINAL map after shutdown (see write_refined_camera_trajectory_csv in
+    synced_capture.py). The refined one is strictly better as a training
+    label: it has the same schema and the same map_epoch column, but the
+    coordinate-frame shift an atlas merge introduces mid-episode -- which
+    map_epoch cannot flag, because merging is not a reset -- has been
+    absorbed instead of recorded as a teleport.
+
+    Falls back to the live file, so episodes recorded before this existed
+    (and any where the refinement step failed) still export."""
+    refined = episode_dir / "camera_trajectory_refined.csv"
+    return refined if refined.is_file() else episode_dir / "camera_trajectory.csv"
+
+
 def expand_episode_dirs(inputs: list[Path]) -> list[Path]:
     """Each input is either an episode dir (has camera_trajectory.csv
     directly) or a parent dir to glob scan_* episode dirs beneath."""
@@ -245,7 +263,7 @@ def process_episode(
     reset is almost always exactly (0,0,0), so most segments share a start
     pose by construction, not coincidence). reports is one summary dict per
     segment (including skipped ones) for the conversion report."""
-    trajectory_rows = read_csv(episode_dir / "camera_trajectory.csv")
+    trajectory_rows = read_csv(camera_trajectory_path(episode_dir))
     host_ns, synced_rows = load_synced_index(episode_dir)
     segments = segment_tracked_rows(trajectory_rows)
 
