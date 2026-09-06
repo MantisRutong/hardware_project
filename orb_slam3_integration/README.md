@@ -138,6 +138,15 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
   against the final map. See **Refined trajectories** below for why that file exists and
   why downstream should prefer it (`output_script/export_dataset.py` already does, falling
   back to the live file for episodes recorded before it existed).
+- `output_script/replay_slam.py` -- re-runs ORB-SLAM3 over an ALREADY-RECORDED episode
+  from its saved IR frames and IMU, instead of tracking while recording. The recordings
+  keep everything needed for this on purpose (raw unmasked IR PNGs, both index files, the
+  IMU CSVs), so a recording can be re-tracked against an atlas that did not exist when it
+  was made, at full frame rate rather than the live 10Hz throttle, with the gripper mask
+  as a clean A/B on identical input. On scan_0011 against `maps/workspace`: 1614 tracked
+  poses vs the live run's 582, exported as one episode with zero speed splits instead of
+  four episodes with three. Only for the data-collection branch -- teleoperation drives
+  the arm from the live pose and has nothing to be offline about.
 - `output_script/build_atlas_map.py` + `synced_capture.py --orbslam-map-dir` -- the
   two-stage approach: build a persistent map ONCE from a deliberate mapping pass, then
   LOCALIZE every demo against it rather than cold-starting a fresh map per episode.
