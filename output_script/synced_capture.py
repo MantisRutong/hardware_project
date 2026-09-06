@@ -589,18 +589,27 @@ class CombinedMonitor:
         # the window can say so -- without feedback there is no way to tell
         # a press that registered from one that missed.
         self.demo_start_offset_s: float | None = None
-        # Set by main()'s _on_orb_pose when an atlas is loaded: one of
-        # "localizing", "merged" or "lost". None means there is nothing to
-        # say -- no live tracker, or no --orbslam-map-dir -- and the panel
-        # stays quiet rather than showing a status that means nothing.
+        # Set by main()'s _on_orb_pose when live tracking is on. None means
+        # there is no live tracker, and the panel stays quiet rather than
+        # showing a status that means nothing.
         #
-        # This is the signal you need before pressing 'm', and it is not the
-        # same as "tracking works". LoadAtlas restores the saved map, but the
-        # session then cold-starts its OWN map and tracks in that -- exactly
-        # the cold start the atlas exists to avoid -- until LoopClosing
-        # merges. Tracking looks fine the whole time. See
-        # OrbSlamTracker.current_map_id.
-        self.atlas_status: str | None = None
+        # This answers the one question the operator has during warm-up:
+        # can I start the demonstration yet? And it is NOT "is tracking
+        # working" -- tracking works long before the answer is yes.
+        #
+        # What actually has to be true is that the map has completed IMU
+        # BA2. LocalMapping's "Not enough motion for initializing" reset --
+        # the one that made careful pick-and-place untrackable, 33% of
+        # frames over scan_0006-0009 -- is gated on !GetIniertialBA2(). Once
+        # that flag is set the gate stops applying for the rest of the
+        # recording, so small careful motion becomes safe. A loaded atlas
+        # was only ever a way to get the same flag without earning it.
+        #
+        # "atlas" is appended when tracking has additionally merged into a
+        # loaded map (see OrbSlamTracker.current_map_id). Nice to know, and
+        # required for a world frame that survives across sessions, but not
+        # what gates starting the demo.
+        self.tracking_status: str | None = None
         # Optional -- the same threading.Event RealSenseCapture/ServoPoller
         # already use to gate whether frames/samples actually get recorded
         # (capture.active). Read-only here, both to show the recording
@@ -665,16 +674,17 @@ class CombinedMonitor:
         cv2.putText(panel, status_text, (margin, 38),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2 if is_recording else 1, cv2.LINE_AA)
 
-        # Atlas relocalization status, right under the recording line -- the
-        # thing to read before pressing 'm'. See self.atlas_status.
-        if self.atlas_status is not None:
-            atlas_text, atlas_color = {
-                "merged": ("ATLAS OK -- merged, safe to press 'm'", self.DEMO_COLOR),
-                "localizing": ("localizing... keep translating 20-30cm", self.WARN_COLOR),
+        # Tracking readiness, right under the recording line -- the thing to
+        # read before pressing 'm'. See self.tracking_status.
+        if self.tracking_status is not None:
+            text, color = {
+                "ready": ("READY -- initialized, safe to press 'm'", self.DEMO_COLOR),
+                "ready_atlas": ("READY + merged into atlas", self.DEMO_COLOR),
+                "warming": ("warming up... keep translating 20-30cm", self.WARN_COLOR),
                 "lost": ("TRACKING LOST", self.RECORDING_COLOR),
-            }[self.atlas_status]
-            cv2.putText(panel, atlas_text, (margin, 58),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, atlas_color, 2, cv2.LINE_AA)
+            }[self.tracking_status]
+            cv2.putText(panel, text, (margin, 58),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2, cv2.LINE_AA)
 
         if len(self.times) >= 2:
             t0, t1 = self.times[0], self.times[-1]
@@ -1664,7 +1674,7 @@ def main() -> int:
                 # leaves the epoch alone. Tracking each session map against
                 # the epoch it belongs to means a reset re-arms the indicator
                 # rather than falsely latching it green forever.
-                if using_atlas and orb is not None and mon is not None:
+                if orb is not None and mon is not None:
                     # State is kept as (epoch, session map id, merged) in one
                     # box, and the status is recomputed from it on EVERY
                     # call. Two bugs came from not doing that: the epoch was
@@ -1679,13 +1689,20 @@ def main() -> int:
                     prev = session_map[0]
                     if prev is None or prev[0] != map_epoch:
                         # New epoch: a reset just created another map for
-                        # this session, so the merge has to happen again.
+                        # this session, so any merge has to happen again.
                         session_map[0] = (map_epoch, map_id, False)
-                    elif not prev[2] and map_id != prev[1]:
+                    elif using_atlas and not prev[2] and map_id != prev[1]:
                         # Same epoch, different map -- ChangeMap, i.e. merged.
                         session_map[0] = (prev[0], prev[1], True)
-                    mon.atlas_status = ("merged" if session_map[0][2]
-                                        else "lost" if pose is None else "localizing")
+                    if pose is None:
+                        mon.tracking_status = "lost"
+                    elif not orb.place_recognition_gates["imu_ba2"]:
+                        # Tracking works here, but the init gate is still
+                        # armed -- the regime that made careful manipulation
+                        # untrackable. Not ready.
+                        mon.tracking_status = "warming"
+                    else:
+                        mon.tracking_status = "ready_atlas" if session_map[0][2] else "ready"
 
             orb_worker = (
                 OrbSlamWorker(orb_tracker, _on_orb_pose, gripper_masks=gripper_masks)
