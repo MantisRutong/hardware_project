@@ -1132,24 +1132,43 @@ def parse_args() -> argparse.Namespace:
                               f"value, since the calibration CSV's kinematic model overshoots it near full-open. "
                               f"Default {GRIPPER_MAX_WIDTH_MM:.1f} (measured 2026-08-19).")
 
-    # Live ORB-SLAM3 (Stereo-Inertial) tracking -- see orbslam_bridge.py. This
-    # is the primary/default live tracker (see module-level comment above
-    # DEFAULT_OPENVINS_CONFIG for why). Needs stereo IR, so enabling this
-    # also turns on --ir-flag-equivalent stereo capture on RealSenseCapture
-    # (see record_ir=args.orbslam below) -- there's no separate --ir-flag
-    # here, since IR is only ever needed for ORB-SLAM3 in this script. Fed
-    # the full native-rate IMU stream (via on_imu_sample, paired
+    # Live ORB-SLAM3 (Stereo-Inertial) tracking -- see orbslam_bridge.py.
+    #
+    # OFF by default: recording and tracking are now separate steps for data
+    # collection. Record here, then run output_script/replay_slam.py over
+    # the result, then export. Measured on scan_0011, same recording both
+    # ways: live produced 582 tracked poses and 581 exported frames across
+    # 4 episodes (3 of them coordinate-frame splits), replay produced 1614
+    # and 1557 in ONE episode with zero splits. The reasons are structural,
+    # not incidental -- live tracking has to share the machine with the
+    # capture thread and so runs at 10Hz against the camera's 30, and it
+    # only ever gets one attempt at a recording, with whatever atlas, mask
+    # and settings existed that day. See replay_slam.py's module docstring.
+    #
+    # Still here, and still the same code path, for two reasons: it is what
+    # umi_teleop.py does (driving an arm from a pose that arrives after the
+    # fact is not a thing), and a live run is the fastest way to check on
+    # the rig that tracking works at all before recording a batch.
+    #
+    # Fed the full native-rate IMU stream (via on_imu_sample, paired
     # nearest-gyro-to-accel same as OpenVINS's own fusion) and every stereo
     # frame pair (via RealSenseCapture's on_stereo_frame hook). A fresh
     # tracker is created per episode (System has no in-place reset exposed
     # here -- see orbslam_bridge.py's docstring), so each episode's
     # camera_trajectory.csv starts its own clean map/pose graph near t=0.
-    parser.add_argument("--orbslam", dest="orbslam", action=argparse.BooleanOptionalAction, default=True,
-                         help="Run live ORB-SLAM3 Stereo-Inertial tracking alongside recording (default: on, "
-                              "the primary live tracker -- see --openvins for the deprecated/comparison-only "
-                              "monocular alternative). Prints tracked position periodically and writes "
-                              "camera_trajectory.csv per episode. Also enables stereo IR capture (ir_left/ "
-                              "ir_right). Use --no-orbslam to skip entirely (e.g. if ORB_SLAM3 isn't built).")
+    parser.add_argument("--orbslam", dest="orbslam", action=argparse.BooleanOptionalAction, default=False,
+                         help="Run live ORB-SLAM3 Stereo-Inertial tracking alongside recording (default: OFF). "
+                              "The recorded trajectory now comes from replay_slam.py afterwards, which tracks "
+                              "the same frames at full rate against a final map -- roughly 2.7x the poses and "
+                              "no unflagged coordinate-frame splits. Turn this on to sanity-check tracking on "
+                              "the rig before recording a batch (it prints tracked position and writes "
+                              "camera_trajectory.csv), not to produce the trajectory you train on. Stereo IR "
+                              "capture is independent of this now -- see --record-ir.")
+    parser.add_argument("--record-ir", dest="record_ir", action=argparse.BooleanOptionalAction, default=True,
+                         help="Save the left/right IR streams (default: on). These are what replay_slam.py "
+                              "tracks afterwards, so a recording made without them can never be re-tracked -- "
+                              "the pose labels would have to come from a live run, or not at all. Used to be "
+                              "implied by --orbslam, back when live tracking was the only consumer.")
     parser.add_argument("--orbslam-settings", type=Path, default=ORBSLAM_DEFAULT_SETTINGS_PATH, dest="orbslam_settings",
                          help=f"ORB-SLAM3 settings YAML (calibration) to use. Default: {ORBSLAM_DEFAULT_SETTINGS_PATH}")
     parser.add_argument("--orbslam-vocab", type=Path, default=ORBSLAM_DEFAULT_VOCAB_PATH, dest="orbslam_vocab",
@@ -1349,13 +1368,14 @@ def main() -> int:
             enable_imu=True,
             record_rgb=True,
             record_depth=args.depth_flag,
-            # ORB-SLAM3 Stereo-Inertial needs left/right IR -- there's no
-            # separate --ir-flag on this script since IR is only ever needed
-            # here for --orbslam. requested_ir left as None (auto-negotiate
-            # from camera_collecting.py's IR_PROFILES) since --orbslam-settings'
-            # calibration was measured at that same auto-negotiated 848x480
-            # default (see ORB_SLAM3/config/RealSense_D435i_ours.yaml).
-            record_ir=args.orbslam,
+            # Stereo-Inertial needs left/right IR, live or offline, so this
+            # is on by default and no longer tied to --orbslam: the frames
+            # replay_slam.py tracks later are exactly these. requested_ir
+            # left as None (auto-negotiate from camera_collecting.py's
+            # IR_PROFILES) since --orbslam-settings' calibration was measured
+            # at that same auto-negotiated 848x480 default (see
+            # ORB_SLAM3/config/RealSense_D435i_ours.yaml).
+            record_ir=args.record_ir,
             queue_size=args.queue_size,
             imu_fps=args.imu_fps,
             # Not using RealSenseCapture's own cv2 preview window -- Combined

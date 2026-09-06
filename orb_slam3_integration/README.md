@@ -126,18 +126,12 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
   override via `OrbSlamTracker(settings_path=..., vocab_path=..., lib_path=...)` or the
   matching `--orbslam-*` CLI flags on `output_script/synced_capture.py` if built
   elsewhere.
-- `output_script/synced_capture.py` -- `--orbslam`/`--no-orbslam` (default: **on**, the
-  primary live tracker) runs ORB-SLAM3 Stereo-Inertial tracking on its own thread
-  (`OrbSlamWorker`) alongside recording, writing live pose to `camera_trajectory.csv`
-  per episode (columns include `map_epoch` -- see its docstring on
-  `write_camera_trajectory_csv` for what a reset means for that file, and for
-  downstream training-data use). Also auto-enables stereo IR capture
-  (`camera/camera_collecting.py`'s `record_ir`) since Stereo-Inertial tracking needs
-  both IR streams, not just color. At the end of each episode it additionally writes
-  `camera_trajectory_refined.csv` -- same schema, same `map_epoch` column, but re-resolved
-  against the final map. See **Refined trajectories** below for why that file exists and
-  why downstream should prefer it (`output_script/export_dataset.py` already does, falling
-  back to the live file for episodes recorded before it existed).
+- `output_script/synced_capture.py` -- records. `--record-ir` (default **on**) saves the
+  left/right IR streams, which is what the tracking pass consumes, live or offline.
+  `--orbslam` (default **off**) additionally runs ORB-SLAM3 on its own thread
+  (`OrbSlamWorker`) during the recording, writing `camera_trajectory.csv` and, at episode
+  end, `camera_trajectory_refined.csv`. That is now a rig sanity check rather than the
+  source of training labels -- see **Recording and tracking are separate steps** below.
 - `output_script/replay_slam.py` -- re-runs ORB-SLAM3 over an ALREADY-RECORDED episode
   from its saved IR frames and IMU, instead of tracking while recording. The recordings
   keep everything needed for this on purpose (raw unmasked IR PNGs, both index files, the
@@ -163,6 +157,68 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc) orb_capi   # our extra
 
 Run `output_script/synced_capture.py --help` for the full flag list, or see this
 directory's patch/new-file comments for anything not covered above.
+
+## Recording and tracking are separate steps
+
+For data collection, `synced_capture.py` records and `replay_slam.py` tracks, afterwards.
+Live tracking (`--orbslam`) defaults to OFF.
+
+```bash
+# 1. record (IR + IMU + RGB + servo). No SLAM running.
+python3 output_script/synced_capture.py --episodes 5
+
+# 2. track, at full rate, against the atlas
+python3 output_script/replay_slam.py recording --map-dir maps/workspace
+
+# 3. export
+python3 output_script/export_dataset.py recording --output dataset.zarr
+```
+
+Measured on scan_0011 -- the same recording taken both ways, exported both ways:
+
+| | tracked poses | exported frames | episodes | speed splits |
+|---|---|---|---|---|
+| live | 582 | 581 | 4 | 3 |
+| replay | 1614 | 1557 | 1 | 0 |
+
+2.7x the frames and 3.0x the usable 16-frame training windows, from bytes that were
+already on disk. The reasons are structural rather than incidental:
+
+- **Rate.** Live tracking shares the machine with the capture thread and is pinned to
+  10Hz (`OrbSlamWorker.min_interval` -- 20Hz reproduced a crash), against a camera
+  recording at 30fps. `export_dataset.py` is pose-driven, so the other two thirds of the
+  frames are simply dropped. Offline there is no capture thread to starve.
+- **One attempt.** A live recording is tracked once, with whatever atlas, mask and
+  settings existed that day, and the result is final. Offline it can be re-tracked when
+  any of those improve.
+- **Experiments.** `--gripper-mask` against `--no-gripper-mask` live means two
+  recordings, which differ in how the operator moved as well as in the mask. Offline it
+  is the same bytes twice.
+
+What is given up: live tracking told you during the recording whether tracking was
+working. Offline you find out afterwards. `--orbslam` is still there for exactly that --
+run one episode with it before recording a batch -- but its output is a check, not a
+label.
+
+Teleoperation is unaffected and always tracks live: `umi_teleop.py` drives the arm from
+the pose, and a pose that arrives after the fact is no use to it.
+
+Two things follow from the default. Recordings must keep their IR (`--record-ir`, on by
+default) or they can never be re-tracked. And an episode recorded this way has no
+`camera_trajectory.csv` at all -- only the `camera_trajectory_refined.csv` that
+`replay_slam.py` writes -- which is why `export_dataset.py` accepts either
+(`has_trajectory`).
+
+### Limits, measured
+
+Replaying does not rescue a recording whose scene was untrackable. scan_0006-0009 were
+recorded before the workspace texture went up, and today they export to literally
+nothing ("No usable frames survived processing" -- their longest continuous tracked run
+is 4 frames). Re-tracked against `maps/workspace` they reach 33-40% of frames and 139-243
+resets, yielding one usable segment each, up to 68 frames. Compare scan_0011, recorded
+after, in the scene the atlas actually covers: 98% and one reset. An atlas only helps
+where it recognises the scene, and no amount of offline processing recovers texture that
+was not in front of the camera.
 
 ## Two-stage mapping (build once, localize per demo)
 

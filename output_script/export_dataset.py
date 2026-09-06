@@ -235,20 +235,36 @@ def camera_trajectory_path(episode_dir: Path) -> Path:
     absorbed instead of recorded as a teleport.
 
     Falls back to the live file, so episodes recorded before this existed
-    (and any where the refinement step failed) still export."""
+    (and any where the refinement step failed) still export. With live
+    tracking off (synced_capture.py's default now) there IS no live file
+    and the refined one is the only trajectory the episode has -- see
+    has_trajectory above."""
     refined = episode_dir / "camera_trajectory_refined.csv"
     return refined if refined.is_file() else episode_dir / "camera_trajectory.csv"
 
 
+def has_trajectory(episode_dir: Path) -> bool:
+    """Whether this directory has a trajectory to export at all.
+
+    Either file counts. A recording made with live tracking has
+    camera_trajectory.csv; one recorded with tracking off (the default now
+    -- see synced_capture.py's --orbslam) has only what replay_slam.py
+    wrote afterwards, and that is camera_trajectory_refined.csv. Requiring
+    the live file would silently skip every episode produced by the
+    offline flow."""
+    return ((episode_dir / "camera_trajectory.csv").is_file()
+            or (episode_dir / "camera_trajectory_refined.csv").is_file())
+
+
 def expand_episode_dirs(inputs: list[Path]) -> list[Path]:
-    """Each input is either an episode dir (has camera_trajectory.csv
-    directly) or a parent dir to glob scan_* episode dirs beneath."""
+    """Each input is either an episode dir (has a trajectory file directly)
+    or a parent dir to glob scan_* episode dirs beneath."""
     episodes: list[Path] = []
     for p in inputs:
-        if (p / "camera_trajectory.csv").is_file():
+        if has_trajectory(p):
             episodes.append(p)
         else:
-            found = sorted(d for d in p.glob("scan_*") if (d / "camera_trajectory.csv").is_file())
+            found = sorted(d for d in p.glob("scan_*") if has_trajectory(d))
             if not found:
                 print(f"WARNING: {p} is neither an episode dir nor a parent of scan_* episode dirs -- skipping",
                       file=sys.stderr)
