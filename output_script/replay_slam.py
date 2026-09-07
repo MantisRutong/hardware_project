@@ -373,6 +373,27 @@ def replay_episode(episode_dir: Path, args: argparse.Namespace) -> dict[str, Any
             summary["refined"] = "skipped_nothing_tracked"
             return summary
         tracker.shutdown()
+
+        # n_tracked > 0 is NOT enough. System::SaveTrajectoryTUM opens with
+        # vpKFs[0]->GetPoseInverse() on Atlas::GetAllKeyFrames(), which
+        # returns the CURRENT map's keyframes, unchecked -- so an episode
+        # that tracked fine and then hit a reset just before shutdown hands
+        # it an empty vector and takes the process down in C++, where no
+        # Python except can catch it. Seen on task1/scan_0007 ("LM: Active
+        # map reset ... 2060 Frames set to lost", then Shutdown, then a
+        # segfault) and on three of scan_0006-0009 before that; in a batch
+        # it also costs every episode queued behind the one that crashed.
+        #
+        # Read after shutdown(), when the mapping and loop-closing threads
+        # have stopped (the wait added to System::Shutdown()), so the count
+        # cannot change under us between the check and the call.
+        n_kf = tracker.place_recognition_gates["keyframes"]
+        if n_kf == 0:
+            summary["refined"] = "skipped_final_map_empty"
+            print("  refined: skipped -- the final map has no keyframes (a reset landed just before "
+                  "shutdown), so there is nothing to re-resolve against. The replay trajectory is "
+                  "still written.")
+            return summary
         tum_path = output_dir / "camera_trajectory_replay.tum"
         tracker.save_trajectory_tum(tum_path)
         refined_path = output_dir / "camera_trajectory_refined.csv"

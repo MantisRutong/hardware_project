@@ -131,10 +131,10 @@ index e1e2717..8076d76 100644
      bool mHasViewer;
  
 diff --git a/include/System.h b/include/System.h
-index 872c86e..4dee255 100644
+index 872c86e..482bec6 100644
 --- a/include/System.h
 +++ b/include/System.h
-@@ -177,6 +177,43 @@ public:
+@@ -177,6 +177,61 @@ public:
      std::vector<MapPoint*> GetTrackedMapPoints();
      std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
  
@@ -174,6 +174,24 @@ index 872c86e..4dee255 100644
 +    // which is exactly the situation the atlas exists to avoid. Comparing
 +    // this against the id the atlas loaded with distinguishes the two.
 +    long unsigned int GetCurrentMapId();
++
++    // Local addition (not upstream): the three things
++    // LoopClosing::NewDetectCommonRegions checks before it will even LOOK
++    // for a place it recognises. Place recognition is the only route into a
++    // loaded atlas (via merge), so when a session never reaches the atlas,
++    // these say which gate held it:
++    //
++    //   if (map->IsInertial() && !map->GetIniertialBA2())  return false;
++    //   if (STEREO && map->GetAllKeyFrames().size() < 5)   return false;
++    //   if (map->GetAllKeyFrames().size() < 12)            return false;
++    //
++    // All three are about the CURRENT map -- the one the session
++    // cold-started, never the loaded atlas -- which is the part that makes
++    // the situation circular and worth measuring rather than reasoning
++    // about.
++    long unsigned int GetCurrentMapKeyFrameCount();
++    bool IsCurrentMapImuInitialized();
++    bool IsCurrentMapImuBA2();
 +
      // For debugging
      double GetTimeFromIMUInit();
@@ -312,7 +330,7 @@ index 93a50be..b26afad 100644
              if(settings.cameraType_ == Settings::PinHole || settings.cameraType_ ==  Settings::Rectified){
                  output << "Pinhole";
 diff --git a/src/System.cc b/src/System.cc
-index 60d9c51..8572bea 100644
+index 60d9c51..9996f5b 100644
 --- a/src/System.cc
 +++ b/src/System.cc
 @@ -21,6 +21,7 @@
@@ -387,7 +405,7 @@ index 60d9c51..8572bea 100644
  
      if(!mStrSaveAtlasToFile.empty())
      {
-@@ -1324,6 +1355,23 @@ int System::GetTrackingState()
+@@ -1324,6 +1355,41 @@ int System::GetTrackingState()
      return mTrackingState;
  }
  
@@ -406,6 +424,24 @@ index 60d9c51..8572bea 100644
 +    // here, same as GetMapEpoch() above.
 +    Map* pMap = mpAtlas->GetCurrentMap();
 +    return pMap ? pMap->GetId() : 0;
++}
++
++long unsigned int System::GetCurrentMapKeyFrameCount()
++{
++    Map* pMap = mpAtlas->GetCurrentMap();
++    return pMap ? pMap->KeyFramesInMap() : 0;
++}
++
++bool System::IsCurrentMapImuInitialized()
++{
++    Map* pMap = mpAtlas->GetCurrentMap();
++    return pMap ? pMap->isImuInitialized() : false;
++}
++
++bool System::IsCurrentMapImuBA2()
++{
++    Map* pMap = mpAtlas->GetCurrentMap();
++    return pMap ? pMap->GetIniertialBA2() : false;
 +}
 +
  vector<MapPoint*> System::GetTrackedMapPoints()
