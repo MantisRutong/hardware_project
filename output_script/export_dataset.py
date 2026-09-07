@@ -216,6 +216,14 @@ from scipy.spatial.transform import Rotation
 # PHYSICALLY IMPOSSIBLE SPEED in the module docstring.
 DEFAULT_MAX_SPEED_MPS = 2.0
 
+# How much of the replay's tracked frames the refined trajectory has to keep
+# before it is worth preferring. 0.8 rather than something near 1.0 because
+# the two outcomes are far apart in practice and nothing lands in between:
+# measured across task1's nineteen episodes, coverage is 83-100% when the
+# recording reset at most once, and 1% when it reset six times. Any threshold
+# in the middle separates them identically.
+DEFAULT_MIN_REFINED_COVERAGE = 0.8
+
 
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as f:
@@ -258,25 +266,84 @@ def demo_start_timestamp(episode_dir: Path) -> float | None:
     return None if ns is None else float(ns) / 1e9
 
 
-def camera_trajectory_path(episode_dir: Path) -> Path:
-    """Prefer the refined trajectory when the episode has one.
+def _n_tracked(path: Path) -> int:
+    """Rows with is_lost == 0, or 0 if the file is missing/unreadable."""
+    if not path.is_file():
+        return 0
+    try:
+        with path.open() as f:
+            return sum(1 for r in csv.DictReader(f) if r.get("is_lost") == "0")
+    except OSError:
+        return 0
 
-    camera_trajectory.csv is what ORB-SLAM3 reported live, frame by frame.
-    camera_trajectory_refined.csv is the same episode re-resolved from its
-    FINAL map after shutdown (see write_refined_camera_trajectory_csv in
-    synced_capture.py). The refined one is strictly better as a training
-    label: it has the same schema and the same map_epoch column, but the
-    coordinate-frame shift an atlas merge introduces mid-episode -- which
-    map_epoch cannot flag, because merging is not a reset -- has been
-    absorbed instead of recorded as a teleport.
 
-    Falls back to the live file, so episodes recorded before this existed
-    (and any where the refinement step failed) still export. With live
-    tracking off (synced_capture.py's default now) there IS no live file
-    and the refined one is the only trajectory the episode has -- see
-    has_trajectory above."""
+def camera_trajectory_path(episode_dir: Path, prefer_refined: bool = False,
+                            min_refined_coverage: float = DEFAULT_MIN_REFINED_COVERAGE) -> Path:
+    """Which of an episode's trajectories to export, most preferred first:
+
+        camera_trajectory_replay.csv    what replay_slam.py tracked, offline
+                                        and at full frame rate -- the default
+        camera_trajectory.csv           what was tracked live during the
+                                        recording, at 10Hz, if --orbslam was on
+        camera_trajectory_refined.csv   the replay re-resolved against its
+                                        final map, only with prefer_refined
+
+    The refined file is what a trajectory SHOULD be: every frame expressed
+    in the final map's frame, so a coordinate shift from loop closure,
+    bundle adjustment or an atlas merge is absorbed rather than recorded as
+    a teleport -- and map_epoch cannot flag any of those, since none of them
+    is a reset. When it works it is strictly better.
+
+    It is not the default because it fails badly and silently when a
+    recording resets often. System::SaveTrajectoryTUM can only resolve
+    frames whose reference keyframe still exists, and a reset destroys the
+    map it belonged to, so everything before the last surviving map comes
+    out marked lost. Measured over task1's nine episodes, refined vs the
+    replay's own tracked frames:
+
+        scan_0003, scan_0004    94%, 100%   (0-1 resets)
+        the other seven         1% - 22%    (7-37 resets)
+
+    Preferring it unconditionally would have exported 52 frames of
+    scan_0001 instead of 1606. The live trajectory is not left unguarded
+    either: map_epoch splits at every reset, and the speed check splits at
+    the coordinate shifts map_epoch cannot see (see the two SPLIT sections
+    in the module docstring). Measured cost of that over the same nine
+    episodes: 3067 tracked frames in the demo segments, 3001 kept, split
+    into 38 episodes rather than 9.
+
+    So neither file wins in general, and which one does is measurable per
+    episode: refined is right exactly when it kept most of the frames. That
+    is the rule below -- take refined when it retains at least
+    min_refined_coverage of the replay's tracked frames, otherwise fall back.
+    Both failure modes are then bounded: a fragmented map cannot cost most of
+    an episode, and a rarely-resetting one still gets its coordinate shifts
+    absorbed rather than split around.
+
+    On task1's nineteen episodes the rule picks refined for eighteen (83-100%
+    coverage) and the replay for one (scan_0003, 1%, six resets). prefer_refined
+    forces refined wherever it exists, ignoring coverage."""
     refined = episode_dir / "camera_trajectory_refined.csv"
-    return refined if refined.is_file() else episode_dir / "camera_trajectory.csv"
+    replay = episode_dir / "camera_trajectory_replay.csv"
+    if prefer_refined and refined.is_file():
+        return refined
+    if refined.is_file() and replay.is_file():
+        n_replay = _n_tracked(replay)
+        # n_replay == 0 means nothing was tracked at all; there is no
+        # coverage to compute and neither file has anything to offer, so
+        # fall through to the plain preference rather than divide by zero.
+        if n_replay > 0 and _n_tracked(refined) >= min_refined_coverage * n_replay:
+            return refined
+    if replay.is_file():
+        return replay
+    live = episode_dir / "camera_trajectory.csv"
+    if live.is_file():
+        return live
+    # Nothing else left: an episode that was replayed but whose replay only
+    # produced a refined file cannot happen (replay_slam.py always writes
+    # the replay csv first), but has_trajectory accepts refined-only dirs,
+    # so honour that rather than returning a path that does not exist.
+    return episode_dir / "camera_trajectory_refined.csv"
 
 
 def has_trajectory(episode_dir: Path) -> bool:
@@ -288,8 +355,9 @@ def has_trajectory(episode_dir: Path) -> bool:
     wrote afterwards, and that is camera_trajectory_refined.csv. Requiring
     the live file would silently skip every episode produced by the
     offline flow."""
-    return ((episode_dir / "camera_trajectory.csv").is_file()
-            or (episode_dir / "camera_trajectory_refined.csv").is_file())
+    return any((episode_dir / n).is_file() for n in
+               ("camera_trajectory_replay.csv", "camera_trajectory.csv",
+                "camera_trajectory_refined.csv"))
 
 
 def expand_episode_dirs(inputs: list[Path]) -> list[Path]:
@@ -416,6 +484,8 @@ def process_episode(
     max_rgb_offset_ms: float,
     max_speed_mps: float = DEFAULT_MAX_SPEED_MPS,
     respect_demo_start: bool = True,
+    prefer_refined: bool = False,
+    min_refined_coverage: float = DEFAULT_MIN_REFINED_COVERAGE,
 ) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]]]:
     """Returns (segments, reports) -- segments is a list of per-episode row
     lists (each inner list is one replay-buffer episode: a surviving
@@ -433,7 +503,7 @@ def process_episode(
     reset is almost always exactly (0,0,0), so most segments share a start
     pose by construction, not coincidence). reports is one summary dict per
     segment (including skipped ones) for the conversion report."""
-    trajectory_rows = read_csv(camera_trajectory_path(episode_dir))
+    trajectory_rows = read_csv(camera_trajectory_path(episode_dir, prefer_refined, min_refined_coverage))
     host_ns, synced_rows = load_synced_index(episode_dir)
 
     # Warm-up is dropped BEFORE segmenting, not after, so a coordinate-frame
@@ -441,7 +511,9 @@ def process_episode(
     # entirely of frames that are then discarded anyway -- and so the
     # reported segments are the ones actually exported.
     demo_start = demo_start_timestamp(episode_dir) if respect_demo_start else None
-    demo_report: dict[str, Any] = {"episode_dir": str(episode_dir)}
+    demo_report: dict[str, Any] = {"episode_dir": str(episode_dir),
+                                    "trajectory": camera_trajectory_path(
+                                        episode_dir, prefer_refined, min_refined_coverage).name}
     if demo_start is None:
         demo_report.update({"status": "no_demo_start_mark", "frames": len(trajectory_rows)})
     else:
@@ -590,6 +662,17 @@ def main() -> None:
                               "start (synced_capture.py's 'm' keypress). Only useful for reproducing an "
                               "older export; the warm-up is sweeping motion with the gripper open, recorded "
                               "so ORB-SLAM3 can relocalize, and it is not the demonstration.")
+    parser.add_argument("--prefer-refined", dest="prefer_refined", action="store_true", default=False,
+                         help="Use camera_trajectory_refined.csv where it exists, instead of the replay's "
+                              "own frame-by-frame output. Strictly better when a recording reset rarely, "
+                              "and much worse when it did not -- a reset destroys the map its frames "
+                              "referenced, so they cannot be re-resolved. See camera_trajectory_path.")
+    parser.add_argument("--min-refined-coverage", type=float, default=DEFAULT_MIN_REFINED_COVERAGE,
+                         help="Use camera_trajectory_refined.csv when it retains at least this fraction of "
+                              f"the replay's tracked frames (default: {DEFAULT_MIN_REFINED_COVERAGE}). Below "
+                              "it, the recording reset often enough that refining threw most of the episode "
+                              "away, and the replay's own output is used instead. 0 always prefers refined, "
+                              "1.1 never does.")
     args = parser.parse_args()
 
     episodes = expand_episode_dirs(args.inputs)
@@ -605,7 +688,8 @@ def main() -> None:
     for episode_dir in episodes:
         segments, reports = process_episode(episode_dir, args.min_segment_frames,
                                             args.max_rgb_offset_ms, args.max_speed_mps,
-                                            args.respect_demo_start)
+                                            args.respect_demo_start, args.prefer_refined,
+                                            args.min_refined_coverage)
         all_reports.extend(reports)
         for segment_rows in segments:
             all_rows.extend(segment_rows)
