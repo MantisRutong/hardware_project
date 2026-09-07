@@ -116,9 +116,59 @@ long orb_get_current_map_id(void *handle) {
     return 0;
   auto *h = static_cast<OrbHandle *>(handle);
   std::lock_guard<std::mutex> lck(h->mtx);
-  if (h->shut_down)
-    return 0;
+  // Deliberately readable AFTER orb_shutdown(). These only read the atlas,
+  // which Shutdown() does not touch -- it stops the mapping and loop-closing
+  // threads, and the System (and its Atlas) live until orb_destroy(). Post-
+  // shutdown is in fact when they are most trustworthy, because nothing is
+  // mutating the map any more; it is also the only moment a caller can check
+  // whether the final map has any keyframes before calling
+  // orb_save_trajectory_tum, which indexes vpKFs[0] unchecked.
   return static_cast<long>(h->sys->GetCurrentMapId());
+}
+
+long orb_get_current_map_kf_count(void *handle) {
+  if (handle == nullptr)
+    return 0;
+  auto *h = static_cast<OrbHandle *>(handle);
+  std::lock_guard<std::mutex> lck(h->mtx);
+  // Deliberately readable AFTER orb_shutdown(). These only read the atlas,
+  // which Shutdown() does not touch -- it stops the mapping and loop-closing
+  // threads, and the System (and its Atlas) live until orb_destroy(). Post-
+  // shutdown is in fact when they are most trustworthy, because nothing is
+  // mutating the map any more; it is also the only moment a caller can check
+  // whether the final map has any keyframes before calling
+  // orb_save_trajectory_tum, which indexes vpKFs[0] unchecked.
+  return static_cast<long>(h->sys->GetCurrentMapKeyFrameCount());
+}
+
+int orb_current_map_imu_initialized(void *handle) {
+  if (handle == nullptr)
+    return 0;
+  auto *h = static_cast<OrbHandle *>(handle);
+  std::lock_guard<std::mutex> lck(h->mtx);
+  // Deliberately readable AFTER orb_shutdown(). These only read the atlas,
+  // which Shutdown() does not touch -- it stops the mapping and loop-closing
+  // threads, and the System (and its Atlas) live until orb_destroy(). Post-
+  // shutdown is in fact when they are most trustworthy, because nothing is
+  // mutating the map any more; it is also the only moment a caller can check
+  // whether the final map has any keyframes before calling
+  // orb_save_trajectory_tum, which indexes vpKFs[0] unchecked.
+  return h->sys->IsCurrentMapImuInitialized() ? 1 : 0;
+}
+
+int orb_current_map_imu_ba2(void *handle) {
+  if (handle == nullptr)
+    return 0;
+  auto *h = static_cast<OrbHandle *>(handle);
+  std::lock_guard<std::mutex> lck(h->mtx);
+  // Deliberately readable AFTER orb_shutdown(). These only read the atlas,
+  // which Shutdown() does not touch -- it stops the mapping and loop-closing
+  // threads, and the System (and its Atlas) live until orb_destroy(). Post-
+  // shutdown is in fact when they are most trustworthy, because nothing is
+  // mutating the map any more; it is also the only moment a caller can check
+  // whether the final map has any keyframes before calling
+  // orb_save_trajectory_tum, which indexes vpKFs[0] unchecked.
+  return h->sys->IsCurrentMapImuBA2() ? 1 : 0;
 }
 
 void orb_shutdown(void *handle) {
